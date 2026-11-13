@@ -32,11 +32,23 @@
 		copy: icon('<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>', 14),
 		check: icon('<path d="m5 12 5 5 9-10"/>', 14),
 		theme: icon('<path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/>'),
+		sun: icon('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
 		download: icon('<path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14"/>'),
 		logout: icon('<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 16l-4-4 4-4M6 12h10"/>'),
 		file: icon('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'),
-		x: icon('<path d="M6 6l12 12M18 6 6 18"/>', 14)
+		x: icon('<path d="M6 6l12 12M18 6 6 18"/>', 14),
+		close: icon('<path d="M6 6l12 12M18 6 6 18"/>', 20),
+		print: icon('<path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/>'),
+		think: icon('<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5M9 18h6M10 22h4"/>', 14),
+		tool: icon('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z"/>', 14),
+		spark: icon('<path d="m12 3 1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3z"/>', 14),
+		archive: icon('<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4"/>', 26)
 	};
+	const logo = (size) =>
+		h('span', {
+			class: 'logo',
+			html: `<svg width="${size}" height="${size}" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M9 11h14M9 16h14M9 21h9" stroke-width="2.4" stroke-linecap="round"/></svg>`
+		});
 
 	const api = async (url, opts) => {
 		const res = await fetch(url, { credentials: 'same-origin', ...opts });
@@ -78,6 +90,8 @@
 		document.documentElement.dataset.theme = dark ? 'dark' : 'light';
 		document.getElementById('hljs-dark').disabled = !dark;
 		document.getElementById('hljs-light').disabled = dark;
+		const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+		if (bg) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bg);
 	};
 	matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 	applyTheme();
@@ -156,7 +170,11 @@
 			try {
 				await navigator.clipboard.writeText(getText());
 				btn.innerHTML = I.check;
-				setTimeout(() => (btn.innerHTML = I.copy), 1200);
+				btn.classList.add('ok');
+				setTimeout(() => {
+					btn.innerHTML = I.copy;
+					btn.classList.remove('ok');
+				}, 1200);
 			} catch {}
 		});
 		return btn;
@@ -226,7 +244,17 @@
 		h('div', { class: 'kv' }, h('div', { class: 'kv-label' }, label), h('pre', { class: 'plain' }, text));
 
 	const collapsible = (title, bodyFn, kind = '') => {
-		const d = h('details', { class: `fold ${kind}` }, h('summary', {}, h('span', { class: 'fold-caret', html: I.chevron }), h('span', {}, title)));
+		const d = h(
+			'details',
+			{ class: `fold ${kind}` },
+			h(
+				'summary',
+				{},
+				h('span', { class: 'fold-caret', html: I.chevron }),
+				kind ? h('span', { class: 'fold-icon', html: kind === 'reasoning' ? I.think : I.tool }) : null,
+				h('span', { class: 'fold-title' }, title)
+			)
+		);
 		let filled = false;
 		d.addEventListener('toggle', () => {
 			if (d.open && !filled) {
@@ -486,6 +514,7 @@
 		const form = h(
 			'form',
 			{ class: 'login' },
+			logo(44),
 			h('h1', {}, '对话归档'),
 			h('p', {}, '请输入访问密码'),
 			input,
@@ -507,7 +536,8 @@
 				input.select();
 			}
 		});
-		$app.replaceChildren(form);
+		document.body.classList.remove('nav-open', 'home');
+		$app.replaceChildren(h('div', { class: 'login-wrap' }, form));
 		input.focus();
 	}
 
@@ -531,8 +561,13 @@
 			h(
 				'div',
 				{ class: 'side-head' },
-				h('a', { class: 'brand', href: '#/' }, '对话归档'),
-				h('button', { class: 'icon-btn', title: '切换深浅色', 'aria-label': '切换深浅色', html: I.theme, onclick: toggleTheme }),
+				h('a', { class: 'brand', href: '#/' }, logo(26), '对话归档'),
+				h(
+					'button',
+					{ class: 'icon-btn', title: '切换深浅色', 'aria-label': '切换深浅色', onclick: toggleTheme },
+					h('span', { class: 'when-light', html: I.theme }),
+					h('span', { class: 'when-dark', html: I.sun })
+				),
 				h('button', {
 					class: 'icon-btn',
 					title: '退出登录',
@@ -542,18 +577,52 @@
 						await fetch('/api/logout', { method: 'POST' });
 						showLogin();
 					}
-				})
+				}),
+				h('button', { class: 'icon-btn side-close', title: '关闭对话列表', 'aria-label': '关闭对话列表', html: I.close, onclick: closeNav })
 			),
-			h('label', { class: 'search' }, h('span', { html: I.search }), $search),
+			h('label', { class: 'search' }, h('span', { html: I.search }), $search, h('kbd', { class: 'kbd', title: '按 / 聚焦搜索', 'aria-hidden': 'true' }, '/')),
 			$tabs,
 			$list,
 			$status
 		);
-		const scrim = h('div', { class: 'scrim', onclick: () => document.body.classList.remove('nav-open') });
+		// 手机端：在抽屉上向左滑动即可收起
+		let swipe = null;
+		sidebar.addEventListener(
+			'touchstart',
+			(e) => {
+				const t = e.touches[0];
+				swipe = e.touches.length === 1 && !e.target.closest('input') ? { x: t.clientX, y: t.clientY } : null;
+			},
+			{ passive: true }
+		);
+		sidebar.addEventListener(
+			'touchend',
+			(e) => {
+				if (!swipe) return;
+				const dx = e.changedTouches[0].clientX - swipe.x;
+				const dy = e.changedTouches[0].clientY - swipe.y;
+				swipe = null;
+				if (dx < -60 && Math.abs(dx) > Math.abs(dy) * 1.5) closeNav();
+			},
+			{ passive: true }
+		);
+		const scrim = h('div', { class: 'scrim', onclick: closeNav });
 		$app.replaceChildren(sidebar, scrim, $main);
+		setHome(!/^#\/c\/.+/.test(location.hash));
 	}
 
+	// 窄屏下没有打开对话时，对话列表直接铺满屏幕（见 style.css 的 .home）；切换是瞬时的，不走抽屉的滑动动画
+	const setHome = (on) => {
+		const cl = document.body.classList;
+		if (cl.contains('home') === on) return;
+		cl.add('no-anim');
+		cl.toggle('home', on);
+		void document.body.offsetWidth;
+		cl.remove('no-anim');
+	};
+
 	const openNav = () => document.body.classList.add('nav-open');
+	const closeNav = () => document.body.classList.remove('nav-open');
 
 	// ───────────── 侧栏 ─────────────
 	const timeGroup = (sec) => {
@@ -585,10 +654,10 @@
 				dataset: { id: c.id },
 				onclick: () => {
 					state.focusMessage = hit?.message_id || null;
-					document.body.classList.remove('nav-open');
+					closeNav();
 				}
 			},
-			h('div', { class: 'chat-title' }, c.title, c.missing_upstream ? h('span', { class: 'dot', title: '源站已删除，仅存于归档' }) : null),
+			h('div', { class: 'chat-title' }, h('span', { class: 'chat-title-text' }, c.title), c.missing_upstream ? h('span', { class: 'dot', title: '源站已删除，仅存于归档' }) : null),
 			hit?.snippet ? snippetNode(hit.snippet) : null,
 			hit ? h('div', { class: 'chat-meta' }, fmtDate(c.updated_at, false), hit.count > 1 ? ` · ${hit.count} 处匹配` : '') : null
 		);
@@ -597,24 +666,26 @@
 
 	function renderSidebar() {
 		const archivedCount = state.chats.filter((c) => c.archived).length;
-		const tab = (key, label) =>
+		const tab = (key, label, count) =>
 			h(
 				'button',
 				{
 					class: 'tab' + (state.view === key ? ' on' : ''),
 					role: 'tab',
-					'aria-selected': state.view === key,
+					'aria-selected': String(state.view === key),
 					onclick: () => {
 						state.view = key;
 						renderSidebar();
 					}
 				},
-				label
+				label,
+				' ',
+				h('span', { class: 'tab-count' }, count)
 			);
 		$tabs.replaceChildren(
 			...[
-			tab('active', `对话 ${state.chats.length - archivedCount}`),
-			tab('archived', `已归档 ${archivedCount}`),
+			tab('active', '对话', state.chats.length - archivedCount),
+			tab('archived', '已归档', archivedCount),
 			state.tag
 				? h(
 						'button',
@@ -626,7 +697,7 @@
 								renderSidebar();
 							}
 						},
-						`#${state.tag} `,
+						h('span', { class: 'tab-label' }, `#${state.tag}`),
 						h('span', { html: I.x })
 					)
 				: null
@@ -672,7 +743,7 @@
 				(kids.get(p) || kids.set(p, []).get(p)).push(f);
 			}
 			const countDeep = (f) => (inFolder.get(f.id)?.length || 0) + (kids.get(f.id) || []).reduce((n, k) => n + countDeep(k), 0);
-			const renderFolder = (f, depth) => {
+			const renderFolder = (f) => {
 				const total = countDeep(f);
 				if (!total) return null; // 空文件夹对归档阅读没有意义
 				const open = state.openFolders.has(f.id);
@@ -680,8 +751,7 @@
 					'button',
 					{
 						class: 'folder' + (open ? ' open' : ''),
-						'aria-expanded': open,
-						style: `padding-left:${10 + depth * 14}px`,
+						'aria-expanded': String(open),
 						onclick: () => {
 							open ? state.openFolders.delete(f.id) : state.openFolders.add(f.id);
 							localStorage.setItem('openFolders', JSON.stringify([...state.openFolders]));
@@ -695,9 +765,9 @@
 				);
 				const box = h('div', { class: 'folder-box' }, head);
 				if (open) {
-					const inner = h('div', { class: 'folder-items', style: `margin-left:${depth * 14 + 16}px` });
+					const inner = h('div', { class: 'folder-items' });
 					for (const k of kids.get(f.id) || []) {
-						const n = renderFolder(k, 0);
+						const n = renderFolder(k);
 						if (n) inner.append(n);
 					}
 					for (const c of inFolder.get(f.id) || []) inner.append(chatItem(c));
@@ -705,7 +775,7 @@
 				}
 				return box;
 			};
-			const roots = (kids.get(null) || []).map((f) => renderFolder(f, 0)).filter(Boolean);
+			const roots = (kids.get(null) || []).map((f) => renderFolder(f)).filter(Boolean);
 			if (roots.length) {
 				frag.append(h('div', { class: 'group-title' }, '文件夹'));
 				frag.append(...roots);
@@ -758,7 +828,9 @@
 		if (!s.configured) line = '未配置同步源';
 		else if (s.running) line = `正在同步${s.phase ? ' · ' + s.phase : ''}`;
 		else line = `${ago(s.last_ok)}同步 · 每 ${s.interval_minutes} 分钟`;
+		const tone = !s.configured ? 'off' : s.running ? 'run' : s.last_error ? 'err' : 'ok';
 		$status.replaceChildren(
+			h('span', { class: `sync-dot ${tone}`, 'aria-hidden': 'true' }),
 			h(
 				'div',
 				{ class: 'sync-text' },
@@ -883,7 +955,13 @@
 		return h(
 			'article',
 			{ class: `msg ${role}`, id: `m-${m.id}`, dataset: { id: m.id } },
-			h('header', { class: 'msg-head' }, h('span', { class: 'who' }, who), ts ? h('time', { title: fmtDate(ts) }, fmtDate(ts)) : null),
+			h(
+				'header',
+				{ class: 'msg-head' },
+				role === 'assistant' ? h('span', { class: 'avatar', 'aria-hidden': 'true', html: I.spark }) : null,
+				h('span', { class: 'who' }, who),
+				ts ? h('time', { title: fmtDate(ts) }, fmtDate(ts)) : null
+			),
 			body,
 			h('footer', { class: 'msg-foot' }, branchNav(entry), copyBtn(() => messageText(m), '复制消息'))
 		);
@@ -922,14 +1000,17 @@
 		if (!id) {
 			state.current = null;
 			document.title = '对话归档';
+			setHome(true);
 			const s = state.status;
+			const stat = (n, label) => h('div', { class: 'stat' }, h('div', { class: 'stat-num' }, n), h('div', { class: 'stat-label' }, label));
 			$main.replaceChildren(
 				topbar(''),
 				h(
 					'div',
 					{ class: 'welcome' },
+					h('div', { class: 'welcome-mark', html: I.archive }),
 					h('h1', {}, '对话归档'),
-					h('p', {}, s ? `共归档 ${s.chats} 个对话、${s.messages} 条消息。` : ''),
+					s ? h('div', { class: 'stats' }, stat(s.chats, '个对话'), stat(s.messages, '条消息')) : null,
 					h('p', { class: 'dim' }, '从左侧选择一个对话开始阅读，或直接搜索全文。')
 				)
 			);
@@ -939,10 +1020,14 @@
 		try {
 			data = await api(`/api/chats/${encodeURIComponent(id)}`);
 		} catch (e) {
-			if (state.currentId === id) $main.replaceChildren(topbar(''), h('div', { class: 'welcome' }, h('h1', {}, '无法打开'), h('p', {}, e.message)));
+			if (state.currentId === id) {
+				setHome(false);
+				$main.replaceChildren(topbar(''), h('div', { class: 'welcome' }, h('h1', {}, '无法打开'), h('p', {}, e.message)));
+			}
 			return;
 		}
 		if (state.currentId !== id) return;
+		setHome(false);
 		const record = data.record;
 		const tree = buildTree(record.chat);
 		state.current = { meta: data, record, tree };
@@ -986,14 +1071,14 @@
 			{ class: 'actions' },
 			h('button', { class: 'btn', onclick: () => download(`${safeName(record.title)}.md`, toMarkdown(), 'text/markdown;charset=utf-8') }, h('span', { html: I.download }), 'Markdown'),
 			h('a', { class: 'btn', href: `/api/chats/${encodeURIComponent(id)}?download`, download: `${safeName(record.title)}.json` }, h('span', { html: I.download }), 'JSON'),
-			h('button', { class: 'btn', onclick: () => window.print() }, '打印')
+			h('button', { class: 'btn', onclick: () => window.print() }, h('span', { html: I.print }), '打印')
 		);
 		$main.replaceChildren(
 			topbar(record.title),
 			h(
 				'div',
 				{ class: 'reader' },
-				h('header', { class: 'chat-head' }, h('h1', {}, record.title), h('div', { class: 'chat-info' }, info.join(' · ')), h('div', { class: 'chat-tags' }, badges, tags), actions),
+				h('header', { class: 'chat-head' }, h('h1', {}, record.title), h('div', { class: 'chat-info' }, info.map((t) => h('span', {}, t))), h('div', { class: 'chat-tags' }, badges, tags), actions),
 				$messages,
 				h('footer', { class: 'reader-foot' }, `最后同步于 ${fmtDate(data.synced_at)} · 只读归档`)
 			)
@@ -1050,7 +1135,7 @@
 			e.preventDefault();
 			openNav();
 			$search.focus();
-		} else if (e.key === 'Escape') document.body.classList.remove('nav-open');
+		} else if (e.key === 'Escape') closeNav();
 	});
 	boot();
 })();
