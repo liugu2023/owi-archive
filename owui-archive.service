@@ -1,0 +1,15 @@
+[Unit]
+Description=Open WebUI chat archive reader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/openwebui/owui-archive
+ExecStart=/home/ubuntu/.nvm/versions/node/v24.22.2/bin/node --env-file=.env server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

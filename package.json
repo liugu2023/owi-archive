@@ -1,0 +1,21 @@
+{
+  "name": "owui-archive",
+  "version": "1.0.0",
+  "description": "Open WebUI 对话的只读归档阅读站（自动同步）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node test/e2e.js"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "@highlightjs/cdn-assets": "^11.12.0",
+    "dompurify": "^3.4.17",
+    "katex": "^0.19.1",
+    "marked": "^18.2.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  }
+}
