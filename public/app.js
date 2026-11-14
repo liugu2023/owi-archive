@@ -1,4 +1,4 @@
-/* 对话归档阅读站前端：只读浏览、搜索、分支切换、导出 */
+/* 对话归档阅读站前端：只读浏览、搜索、分支切换、导出，以及查找 / 目录 / 续读等阅读工具 */
 (() => {
 	'use strict';
 
@@ -42,7 +42,17 @@
 		think: icon('<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5M9 18h6M10 22h4"/>', 14),
 		tool: icon('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z"/>', 14),
 		spark: icon('<path d="m12 3 1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3z"/>', 14),
-		archive: icon('<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4"/>', 26)
+		archive: icon('<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4"/>', 26),
+		find: icon('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>', 18),
+		list: icon('<path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/>', 18),
+		type: icon('<path d="M3 18 8.5 5h1L15 18M5.2 13.5h7.6M17 18v-5.5a2.5 2.5 0 0 1 5 0V18M22 15.5h-5"/>', 18),
+		up: icon('<path d="m6 15 6-6 6 6"/>', 18),
+		down: icon('<path d="m6 9 6 6 6-6"/>', 18),
+		toTop: icon('<path d="M12 20V8m0 0-5 5m5-5 5 5M5 4h14"/>', 18),
+		toBottom: icon('<path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/>', 18),
+		external: icon('<path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>'),
+		clock: icon('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', 14),
+		link: icon('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>', 14)
 	};
 	const logo = (size) =>
 		h('span', {
@@ -98,6 +108,50 @@
 	const toggleTheme = () => {
 		localStorage.setItem('theme', document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
 		applyTheme();
+	};
+
+	// ───────────── 阅读偏好与阅读记录（仅存在本机浏览器里） ─────────────
+	const store = {
+		get(key, fallback) {
+			try {
+				const v = JSON.parse(localStorage.getItem(key));
+				return v ?? fallback;
+			} catch {
+				return fallback;
+			}
+		},
+		set(key, value) {
+			try {
+				localStorage.setItem(key, JSON.stringify(value));
+			} catch {}
+		}
+	};
+	const FONT_STEPS = [0.9, 1, 1.1, 1.2, 1.35];
+	const prefs = { font: 1, wide: false, wrap: false, ...store.get('reader', {}) };
+	if (!(prefs.font >= 0 && prefs.font < FONT_STEPS.length)) prefs.font = 1;
+	const applyPrefs = () => {
+		document.documentElement.style.setProperty('--fs', FONT_STEPS[prefs.font]);
+		document.documentElement.classList.toggle('wide', !!prefs.wide);
+		document.documentElement.classList.toggle('code-wrap', !!prefs.wrap);
+		store.set('reader', prefs);
+	};
+	applyPrefs();
+
+	if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+	let restoreOnLoad = ['reload', 'back_forward'].includes(performance.getEntriesByType?.('navigation')[0]?.type);
+
+	// 每个对话读到哪里：{ [chatId]: { m: 消息 id, r: 该消息内的相对位置, p: 整体进度 0-100, t: 时间戳 } }
+	const READ_MAX = 60;
+	const reading = store.get('reading', {});
+	const unfinished = (id) => reading[id]?.p >= 3 && reading[id].p <= 97;
+	const saveReading = (id, pos) => {
+		reading[id] = { ...pos, t: Date.now() };
+		const ids = Object.keys(reading);
+		if (ids.length > READ_MAX) {
+			ids.sort((a, b) => reading[a].t - reading[b].t);
+			for (const old of ids.slice(0, ids.length - READ_MAX)) delete reading[old];
+		}
+		store.set('reading', reading);
 	};
 
 	// ───────────── Markdown 渲染 ─────────────
@@ -164,15 +218,15 @@
 		return DOMPurify.sanitize(html, { FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select'], FORBID_ATTR: ['style'] });
 	};
 
-	const copyBtn = (getText, label = '复制') => {
-		const btn = h('button', { class: 'icon-btn', title: label, 'aria-label': label, html: I.copy });
+	const copyBtn = (getText, label = '复制', ico = I.copy) => {
+		const btn = h('button', { class: 'icon-btn', title: label, 'aria-label': label, html: ico });
 		btn.addEventListener('click', async () => {
 			try {
 				await navigator.clipboard.writeText(getText());
 				btn.innerHTML = I.check;
 				btn.classList.add('ok');
 				setTimeout(() => {
-					btn.innerHTML = I.copy;
+					btn.innerHTML = ico;
 					btn.classList.remove('ok');
 				}, 1200);
 			} catch {}
@@ -256,11 +310,13 @@
 			)
 		);
 		let filled = false;
+		d._fill = () => {
+			if (filled) return;
+			filled = true;
+			d.append(h('div', { class: 'fold-body' }, bodyFn()));
+		};
 		d.addEventListener('toggle', () => {
-			if (d.open && !filled) {
-				filled = true;
-				d.append(h('div', { class: 'fold-body' }, bodyFn()));
-			}
+			if (d.open) d._fill();
 		});
 		return d;
 	};
@@ -345,8 +401,13 @@
 	const renderContentStringOrMd = (s) => mdNode(s);
 
 	const imageNode = (src) => {
-		const img = h('img', { class: 'attach-img', src, loading: 'lazy', alt: '图片', referrerpolicy: 'no-referrer' });
-		img.addEventListener('click', () => window.open(src, '_blank', 'noopener'));
+		const img = h('img', { class: 'attach-img', src, loading: 'lazy', alt: '图片', referrerpolicy: 'no-referrer', tabindex: '0', role: 'button', 'aria-label': '查看图片' });
+		img.addEventListener('click', () => openLightbox(src));
+		img.addEventListener('keydown', (e) => {
+			if (e.key !== 'Enter' && e.key !== ' ') return;
+			e.preventDefault();
+			openLightbox(src);
+		});
 		img.addEventListener('error', () => img.replaceWith(h('div', { class: 'chip dim' }, '图片未归档')));
 		return img;
 	};
@@ -503,7 +564,9 @@
 		openFolders: new Set(JSON.parse(localStorage.getItem('openFolders') || '[]')),
 		currentId: null,
 		current: null, // { meta, record, tree }
-		focusMessage: null
+		focusMessage: null,
+		findQuery: null, // 从搜索结果点进来时，在对话里高亮这个词
+		resume: false // 从「继续阅读」点进来时，直接回到上次的位置
 	};
 
 	// ───────────── 登录 ─────────────
@@ -536,7 +599,12 @@
 				input.select();
 			}
 		});
-		document.body.classList.remove('nav-open', 'home');
+		closeLightbox();
+		closePop();
+		hideToast();
+		state.current = null;
+		$find = null;
+		document.body.classList.remove('nav-open', 'home', 'scrolled', 'can-top', 'can-bottom');
 		$app.replaceChildren(h('div', { class: 'login-wrap' }, form));
 		input.focus();
 	}
@@ -621,8 +689,35 @@
 		cl.remove('no-anim');
 	};
 
-	const openNav = () => document.body.classList.add('nav-open');
+	const openNav = () => {
+		closePop();
+		refreshRecents();
+		document.body.classList.add('nav-open');
+	};
+	// 侧栏顶部的「继续阅读」：最近读到一半的对话
+	const recentChats = () =>
+		state.results || state.view === 'archived' || state.tag
+			? []
+			: state.chats
+					.filter((c) => !c.archived && unfinished(c.id))
+					.sort((a, b) => reading[b.id].t - reading[a.id].t)
+					.slice(0, 3);
+	const sigOf = (list) => list.map((c) => `${c.id}:${reading[c.id].p}`).join('|');
+	let recentSig = '';
+	const refreshRecents = () => {
+		if (!$list || sigOf(recentChats()) === recentSig) return;
+		// 列表已经往下滚过时，重排后让眼前的条目留在原地，变化发生在上方
+		const rows = () => [...$list.querySelectorAll('.chat-item:not(.recent)')];
+		const edge = $list.getBoundingClientRect().top;
+		const anchor = $list.scrollTop > 0 ? rows().find((el) => el.getBoundingClientRect().bottom > edge) : null;
+		const before = anchor?.getBoundingClientRect().top;
+		renderSidebar();
+		const after = anchor && rows().find((el) => el.dataset.id === anchor.dataset.id);
+		if (after) $list.scrollTop += after.getBoundingClientRect().top - before;
+	};
 	const closeNav = () => document.body.classList.remove('nav-open');
+	// 桌面端侧栏常驻，nav-open 只在窄屏下才表示「抽屉盖在正文上」
+	const navShowing = () => document.body.classList.contains('nav-open') && matchMedia('(max-width: 860px)').matches;
 
 	// ───────────── 侧栏 ─────────────
 	const timeGroup = (sec) => {
@@ -645,19 +740,27 @@
 		return el;
 	};
 
-	const chatItem = (c, hit) => {
+	const chatItem = (c, hit, pct) => {
 		const a = h(
 			'a',
 			{
-				class: 'chat-item' + (c.id === state.currentId ? ' active' : ''),
+				class: 'chat-item' + (c.id === state.currentId ? ' active' : '') + (pct != null ? ' recent' : ''),
 				href: `#/c/${c.id}`,
 				dataset: { id: c.id },
-				onclick: () => {
+				onclick: (e) => {
 					state.focusMessage = hit?.message_id || null;
 					closeNav();
+					if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return; // 在新标签页 / 新窗口打开
+					state.findQuery = hit?.message_id ? state.query.split(/\s+/)[0] : null;
+					state.resume = pct != null;
+					if (c.id !== state.currentId || state.current?.id !== c.id) return;
+					// 已经打开着的对话：地址不变，不会触发路由
+					if (hit?.message_id) jumpToHit();
+					else if (pct != null && unfinished(c.id)) resumeTo({ ...reading[c.id] });
+					state.resume = false;
 				}
 			},
-			h('div', { class: 'chat-title' }, h('span', { class: 'chat-title-text' }, c.title), c.missing_upstream ? h('span', { class: 'dot', title: '源站已删除，仅存于归档' }) : null),
+			h('div', { class: 'chat-title' }, h('span', { class: 'chat-title-text' }, c.title), c.missing_upstream ? h('span', { class: 'dot', title: '源站已删除，仅存于归档' }) : null, pct != null ? h('span', { class: 'read-pct', title: '上次读到这里' }, `${pct}%`) : null),
 			hit?.snippet ? snippetNode(hit.snippet) : null,
 			hit ? h('div', { class: 'chat-meta' }, fmtDate(c.updated_at, false), hit.count > 1 ? ` · ${hit.count} 处匹配` : '') : null
 		);
@@ -665,6 +768,8 @@
 	};
 
 	function renderSidebar() {
+		const recent = recentChats();
+		recentSig = sigOf(recent);
 		const archivedCount = state.chats.filter((c) => c.archived).length;
 		const tab = (key, label, count) =>
 			h(
@@ -725,6 +830,10 @@
 		}
 
 		const flat = state.view === 'archived' || state.tag;
+		if (recent.length) {
+			frag.append(h('div', { class: 'group-title' }, '继续阅读'));
+			for (const c of recent) frag.append(chatItem(c, null, reading[c.id].p));
+		}
 		const pinned = flat ? [] : chats.filter((c) => c.pinned);
 		if (pinned.length) {
 			frag.append(h('div', { class: 'group-title' }, '置顶'));
@@ -963,7 +1072,7 @@
 				ts ? h('time', { title: fmtDate(ts) }, fmtDate(ts)) : null
 			),
 			body,
-			h('footer', { class: 'msg-foot' }, branchNav(entry), copyBtn(() => messageText(m), '复制消息'))
+			h('footer', { class: 'msg-foot' }, branchNav(entry), copyBtn(() => messageText(m), '复制消息'), copyBtn(() => msgLink(m.id), '复制这条消息的链接', I.link))
 		);
 	};
 
@@ -972,6 +1081,11 @@
 		const path = state.current.tree.path();
 		$messages.replaceChildren(...path.map(renderMessage));
 		if (!path.length) $messages.append(h('div', { class: 'empty' }, '这个对话没有消息'));
+		// 切换分支后重新标出查找结果
+		if ($find && !$find.bar.hidden && find.q) {
+			runFind();
+			gotoHit(0, false);
+		}
 	}
 
 	const download = (name, text, type) => {
@@ -994,12 +1108,510 @@
 		return lines.join('\n');
 	};
 
-	async function openChat(id) {
+	// ───────────── 阅读工具：定位 / 查找 / 目录 / 设置 / 进度 ─────────────
+	const topOffset = () => {
+		const tb = document.querySelector('.topbar');
+		return (tb ? tb.getBoundingClientRect().height : 0) + 12;
+	};
+	const scrollToEl = (el) => window.scrollTo(0, Math.max(0, el.getBoundingClientRect().top + window.scrollY - topOffset()));
+	const msgEls = () => [...($messages?.children || [])].filter((el) => el.classList.contains('msg'));
+	// 当前正在读的消息：第一条还没完全滚出顶栏的
+	const currentMsg = () => {
+		const off = topOffset();
+		const els = msgEls();
+		return els.find((el) => el.getBoundingClientRect().bottom > off + 1) || els[els.length - 1] || null;
+	};
+	const readPos = () => {
+		const el = currentMsg();
+		if (!el) return null;
+		const r = el.getBoundingClientRect();
+		return { m: el.dataset.id, r: Math.round(Math.min(1, Math.max(0, (topOffset() - r.top) / Math.max(1, r.height))) * 1000) / 1000 };
+	};
+	const restorePos = (pos) => {
+		if (!pos?.m || !state.current) return false;
+		const { tree } = state.current;
+		if (!document.getElementById(`m-${pos.m}`) && tree.map[pos.m]) {
+			tree.selectPathTo(pos.m);
+			renderMessages();
+		}
+		const el = document.getElementById(`m-${pos.m}`);
+		if (!el) return false;
+		const r = el.getBoundingClientRect();
+		window.scrollTo(0, Math.max(0, r.top + window.scrollY + (pos.r || 0) * r.height - topOffset()));
+		return true;
+	};
+	// 版式变化（字号、宽度、展开折叠）前后，保持正在读的那一段不动
+	const keepPos = (fn) => {
+		const pos = window.scrollY > 4 ? readPos() : null;
+		fn();
+		if (pos) restorePos(pos);
+	};
+	const flashMsg = (mid) => {
+		const el = document.getElementById(`m-${mid}`);
+		if (!el) return null;
+		scrollToEl(el);
+		el.classList.remove('flash');
+		void el.offsetWidth;
+		el.classList.add('flash');
+		return el;
+	};
+	const stepMsg = (dir) => {
+		const els = msgEls();
+		const cur = currentMsg();
+		if (!cur) return;
+		const i = els.indexOf(cur);
+		const into = topOffset() - cur.getBoundingClientRect().top;
+		const target = dir > 0 ? (into < -8 ? cur : els[i + 1]) : into > 8 ? cur : els[i - 1];
+		if (target) scrollToEl(target);
+		else window.scrollTo(0, dir > 0 ? document.documentElement.scrollHeight : 0);
+	};
+	const setFolds = (open) =>
+		keepPos(() => {
+			// 展开时内层的折叠块才会生成，多走几遍
+			for (let pass = 0; pass < 3; pass++) {
+				for (const d of $messages.querySelectorAll('details')) {
+					if (open) d._fill?.();
+					d.open = open;
+				}
+			}
+		});
+	const toggleFolds = () => setFolds(!!$messages.querySelector('details:not([open])'));
+
+	// ── 图片查看 ──
+	let $lightbox = null;
+	let lbReturn = null;
+	const closeLightbox = () => {
+		if (!$lightbox) return false;
+		$lightbox.remove();
+		$lightbox = null;
+		document.body.classList.remove('lb-open');
+		if (lbReturn?.isConnected) lbReturn.focus({ preventScroll: true });
+		lbReturn = null;
+		return true;
+	};
+	const openLightbox = (src) => {
+		closeLightbox();
+		lbReturn = document.activeElement;
+		const img = h('img', { src, alt: '图片', referrerpolicy: 'no-referrer' });
+		img.addEventListener('click', (e) => {
+			e.stopPropagation();
+			$lightbox.classList.toggle('zoomed');
+		});
+		const close = h('button', { class: 'icon-btn', title: '关闭', 'aria-label': '关闭', html: I.close, onclick: closeLightbox });
+		$lightbox = h(
+			'div',
+			{ class: 'lightbox', role: 'dialog', 'aria-modal': 'true', 'aria-label': '查看图片', onclick: closeLightbox },
+			h(
+				'div',
+				{ class: 'lightbox-bar', onclick: (e) => e.stopPropagation() },
+				// 浏览器不允许在新标签页直接打开 data: 地址
+				src.startsWith('data:') ? null : h('a', { class: 'icon-btn', href: src, target: '_blank', rel: 'noopener noreferrer', title: '在新标签页打开', 'aria-label': '在新标签页打开', html: I.external }),
+				close
+			),
+			h('div', { class: 'lightbox-stage' }, img)
+		);
+		document.body.append($lightbox);
+		document.body.classList.add('lb-open');
+		close.focus();
+	};
+
+	// ── 对话内查找（包括还没展开的思考过程和工具结果） ──
+	const find = { q: '', hits: [], idx: -1, origin: 0 };
+	let $find = null; // { bar, input, count, prev, next }
+	const FIND_MAX = 1000;
+	const FIND_SKIP = '.katex, .msg-head, .msg-foot, .code-head, .sources-label';
+	const FIND_BLOCK = 'p, li, pre, td, th, h1, h2, h3, h4, h5, h6, blockquote, summary, .kv-label, .error-box, .chip';
+	const clearMarks = () => {
+		const parents = new Set();
+		for (const mk of document.querySelectorAll('mark.hit')) {
+			parents.add(mk.parentNode);
+			mk.replaceWith(document.createTextNode(mk.textContent));
+		}
+		for (const p of parents) p.normalize();
+		find.hits = [];
+		find.idx = -1;
+	};
+	const showCount = () => {
+		if (!$find) return;
+		const n = find.hits.length;
+		$find.count.textContent = !find.q ? '' : !n ? '无结果' : `${find.idx + 1} / ${n >= FIND_MAX ? FIND_MAX + '+' : n}`;
+		$find.bar.classList.toggle('none', !!find.q && !n);
+		$find.prev.disabled = $find.next.disabled = n < 2;
+	};
+	const gotoHit = (i, scroll = true) => {
+		const n = find.hits.length;
+		if (!n) return showCount();
+		for (const mk of find.hits[find.idx] || []) mk.classList.remove('cur');
+		find.idx = ((i % n) + n) % n;
+		const hit = find.hits[find.idx];
+		for (const mk of hit) mk.classList.add('cur');
+		if (scroll) {
+			for (let d = hit[0].closest('details'); d; d = d.parentElement.closest('details')) {
+				if (!d.querySelector(':scope > summary')?.contains(hit[0])) d.open = true;
+			}
+			hit[0].scrollIntoView({ block: 'center', inline: 'nearest' });
+		}
+		showCount();
+	};
+	// 命中在页面上的纵向位置；收起的折叠块里的命中按折叠块的位置算
+	const hitY = (hit) => {
+		let el = hit[0];
+		for (let d = el.closest('details:not([open])'); d; d = d.parentElement?.closest('details:not([open])')) el = d;
+		return el.getBoundingClientRect().top + window.scrollY;
+	};
+	const nearestHit = (fromY) => Math.max(0, find.hits.findIndex((hit) => hitY(hit) >= fromY + topOffset() - 1));
+	const runFind = () => {
+		clearMarks();
+		const q = find.q.toLowerCase();
+		if (!q || !$messages) return showCount();
+		for (let pass = 0; pass < 3; pass++) for (const d of $messages.querySelectorAll('details.fold')) d._fill?.();
+		// 同一个段落里相邻的文本节点拼起来再找，这样跨越加粗、代码高亮等标签的词也能命中
+		const groups = [];
+		let lastKey = null;
+		const walker = document.createTreeWalker($messages, NodeFilter.SHOW_TEXT);
+		for (let n; (n = walker.nextNode()); ) {
+			const pe = n.parentElement;
+			if (!pe || pe.closest(FIND_SKIP)) continue;
+			const key = pe.closest(FIND_BLOCK) || pe;
+			if (key !== lastKey) {
+				groups.push([]);
+				lastKey = key;
+			}
+			groups[groups.length - 1].push(n);
+		}
+		const hits = [];
+		for (const nodes of groups) {
+			if (hits.length >= FIND_MAX) break;
+			const starts = [];
+			let text = '';
+			for (const n of nodes) {
+				starts.push(text.length);
+				text += n.nodeValue;
+			}
+			const low = text.toLowerCase();
+			const hay = low.length === text.length ? low : text; // 个别字符转小写后长度会变
+			const segs = nodes.map(() => []);
+			let any = false;
+			for (let at = hay.indexOf(q); at >= 0 && hits.length < FIND_MAX; at = hay.indexOf(q, at + q.length)) {
+				const hit = [];
+				hits.push(hit);
+				any = true;
+				const end = at + q.length;
+				for (let k = 0; k < nodes.length && starts[k] < end; k++) {
+					const s = Math.max(at, starts[k]);
+					const e = Math.min(end, starts[k] + nodes[k].nodeValue.length);
+					if (s < e) segs[k].push({ s: s - starts[k], e: e - starts[k], hit });
+				}
+			}
+			if (!any) continue;
+			nodes.forEach((n, k) => {
+				const made = [];
+				for (const sg of segs[k].reverse()) {
+					const mid = n.splitText(sg.s);
+					mid.splitText(sg.e - sg.s);
+					const mk = h('mark', { class: 'hit' });
+					mid.replaceWith(mk);
+					mk.append(mid);
+					made.push([sg.hit, mk]);
+				}
+				for (const [hit, mk] of made.reverse()) hit.push(mk);
+			});
+		}
+		find.hits = hits;
+		showCount();
+	};
+	const openFind = (q, { focus = true, scroll = true } = {}) => {
+		if (!$find) return;
+		closePop();
+		$find.bar.hidden = false;
+		document.querySelector('[data-tool="find"]')?.setAttribute('aria-pressed', 'true');
+		if (q != null) $find.input.value = q;
+		find.q = $find.input.value.trim();
+		find.origin = window.scrollY;
+		runFind();
+		// 从当前阅读位置往下的第一处开始
+		if (find.hits.length) gotoHit(nearestHit(find.origin), scroll);
+		if (focus) {
+			$find.input.focus();
+			$find.input.select();
+		}
+	};
+	const closeFind = () => {
+		if (!$find || $find.bar.hidden) return false;
+		$find.input.blur(); // 否则焦点会在隐藏的输入框里多停一帧，紧接着按的快捷键会被当成打字
+		$find.bar.hidden = true;
+		document.querySelector('[data-tool="find"]')?.setAttribute('aria-pressed', 'false');
+		find.q = '';
+		clearMarks();
+		return true;
+	};
+	const findBar = () => {
+		const input = h('input', { type: 'search', placeholder: '在对话中查找…', 'aria-label': '在对话中查找', enterkeyhint: 'search', autocomplete: 'off' });
+		const count = h('span', { class: 'find-count', role: 'status' });
+		const prev = h('button', { class: 'icon-btn', title: '上一处 (Shift+Enter)', 'aria-label': '上一处', html: I.up, onclick: () => gotoHit(find.idx - 1) });
+		const next = h('button', { class: 'icon-btn', title: '下一处 (Enter)', 'aria-label': '下一处', html: I.down, onclick: () => gotoHit(find.idx + 1) });
+		const bar = h('div', { class: 'findbar', hidden: true }, h('label', { class: 'find-field' }, h('span', { html: I.search }), input, count), prev, next, h('button', { class: 'icon-btn', title: '关闭查找 (Esc)', 'aria-label': '关闭查找', html: I.close, onclick: closeFind }));
+		let timer;
+		input.addEventListener('input', () => {
+			clearTimeout(timer);
+			timer = setTimeout(() => {
+				find.q = input.value.trim();
+				if (!find.q) find.origin = window.scrollY;
+				runFind();
+				gotoHit(nearestHit(find.origin));
+			}, 160);
+		});
+		input.addEventListener('keydown', (e) => {
+			if (e.key !== 'Enter') return;
+			e.preventDefault();
+			gotoHit(find.idx + (e.shiftKey ? -1 : 1));
+		});
+		$find = { bar, input, count, prev, next };
+		return bar;
+	};
+
+	// ── 弹出面板：目录 / 阅读设置 ──
+	let $pop = null;
+	let popKind = null;
+	const closePop = () => {
+		if (!$pop) return false;
+		$pop.remove();
+		$pop = null;
+		popKind = null;
+		for (const b of document.querySelectorAll('.tools [aria-expanded]')) b.setAttribute('aria-expanded', 'false');
+		return true;
+	};
+	const togglePop = (kind) => {
+		const same = popKind === kind;
+		closePop();
+		const bar = document.querySelector('.topbar');
+		if (same || !bar || !state.current) return;
+		$pop = h('div', { class: `pop pop-${kind}`, role: 'dialog', 'aria-label': kind === 'outline' ? '目录' : '阅读设置' }, kind === 'outline' ? buildOutline() : buildSettings());
+		popKind = kind;
+		bar.append($pop);
+		document.querySelector(`[data-tool="${kind}"]`)?.setAttribute('aria-expanded', 'true');
+		const on = $pop.querySelector('.outline-item.on');
+		if (on) on.parentElement.scrollTop = on.offsetTop - on.parentElement.clientHeight / 2;
+	};
+	document.addEventListener('pointerdown', (e) => {
+		if ($pop && !e.target.closest?.('.pop, .tools')) closePop();
+	});
+
+	const buildOutline = () => {
+		const path = state.current.tree.path();
+		if (!path.length) return h('div', { class: 'empty' }, '这个对话没有消息');
+		const asked = path.filter((e) => e.msg.role === 'user');
+		const items = asked.length ? asked : path;
+		const order = path.map((e) => String(e.msg.id));
+		const at = order.indexOf(currentMsg()?.dataset.id);
+		let active = null;
+		for (const e of items) if (order.indexOf(String(e.msg.id)) <= at) active = e;
+		return [
+			h('div', { class: 'pop-title' }, asked.length ? `目录 · ${items.length} 个提问` : `目录 · ${items.length} 条消息`),
+			h(
+				'div',
+				{ class: 'outline' },
+				items.map((e, i) =>
+					h(
+						'button',
+						{
+							class: 'outline-item' + (e === active ? ' on' : ''),
+							'aria-current': e === active ? 'true' : null,
+							onclick: () => {
+								closePop();
+								flashMsg(e.msg.id);
+							}
+						},
+						h('span', { class: 'outline-n' }, i + 1),
+						h('span', { class: 'outline-t' }, messageText(e.msg).replace(/\s+/g, ' ').trim().slice(0, 90) || '（图片 / 附件）')
+					)
+				)
+			)
+		];
+	};
+
+	const buildSettings = () => {
+		const val = h('span', { class: 'font-val' });
+		const minus = h('button', { class: 'btn', 'aria-label': '减小字号', onclick: () => step(-1) }, 'A−');
+		const plus = h('button', { class: 'btn', 'aria-label': '增大字号', onclick: () => step(1) }, 'A+');
+		const show = () => {
+			val.textContent = `${Math.round(FONT_STEPS[prefs.font] * 100)}%`;
+			minus.disabled = prefs.font === 0;
+			plus.disabled = prefs.font === FONT_STEPS.length - 1;
+		};
+		const step = (d) => {
+			prefs.font = Math.min(FONT_STEPS.length - 1, Math.max(0, prefs.font + d));
+			keepPos(applyPrefs);
+			show();
+		};
+		show();
+		const sw = (label, key, cls = '') => {
+			const b = h(
+				'button',
+				{
+					class: `switch ${cls}`,
+					role: 'switch',
+					'aria-checked': String(!!prefs[key]),
+					onclick: () => {
+						prefs[key] = !prefs[key];
+						b.setAttribute('aria-checked', String(prefs[key]));
+						keepPos(applyPrefs);
+					}
+				},
+				h('span', {}, label),
+				h('span', { class: 'switch-knob', 'aria-hidden': 'true' })
+			);
+			return b;
+		};
+		const key = (k, label) => h('div', { class: 'key-row' }, h('span', {}, label), h('span', {}, k.split(' ').map((x) => h('kbd', { class: 'kbd' }, x))));
+		return [
+			h('div', { class: 'pop-title' }, '阅读设置'),
+			h('div', { class: 'set-row' }, h('span', {}, '正文字号'), h('span', { class: 'font-step' }, minus, val, plus)),
+			sw('宽版布局', 'wide', 'only-desktop'),
+			sw('代码自动换行', 'wrap'),
+			h(
+				'div',
+				{ class: 'set-row' },
+				h('span', {}, '思考过程 / 工具调用'),
+				h('span', { class: 'font-step' }, h('button', { class: 'btn', onclick: () => setFolds(true) }, '全部展开'), h('button', { class: 'btn', onclick: () => setFolds(false) }, '全部收起'))
+			),
+			h(
+				'div',
+				{ class: 'keys' },
+				h('div', { class: 'pop-title' }, '快捷键'),
+				key('J K', '下一条 / 上一条消息'),
+				key('F', '对话内查找'),
+				key('O', '目录'),
+				key('E', '展开 / 收起全部折叠块'),
+				key('G', '回到顶部（Shift+G 到底部）'),
+				key('/', '搜索全部对话')
+			)
+		];
+	};
+
+	// ── 阅读进度与续读 ──
+	let $toast = null;
+	let toastTimer = 0;
+	const hideToast = () => {
+		clearTimeout(toastTimer);
+		$toast?.remove();
+		$toast = null;
+		document.body.classList.remove('has-toast');
+	};
+	const resumeTo = (pos) => {
+		hideToast();
+		if (!restorePos(pos)) window.scrollTo(0, ((document.documentElement.scrollHeight - window.innerHeight) * pos.p) / 100);
+	};
+	const showResume = (pos) => {
+		hideToast();
+		$toast = h(
+			'div',
+			{ class: 'toast', role: 'status' },
+			h('span', { html: I.clock }),
+			h('span', { class: 'toast-text' }, `上次读到 ${pos.p}%`),
+			h(
+				'button',
+				{
+					class: 'toast-btn',
+					onclick: () => resumeTo(pos)
+				},
+				'继续阅读'
+			),
+			h('button', { class: 'icon-btn', title: '关闭', 'aria-label': '关闭', html: I.x, onclick: hideToast })
+		);
+		$main.append($toast);
+		document.body.classList.add('has-toast');
+		toastTimer = setTimeout(hideToast, 12000);
+	};
+	let scrollRaf = 0;
+	let saveTimer = 0;
+	let lastY = 0;
+	let goingUp = false;
+	const updateProgress = (save = true) => {
+		const bar = document.querySelector('.progress i');
+		if (!state.current || !bar) return;
+		const y = window.scrollY;
+		const max = document.documentElement.scrollHeight - window.innerHeight;
+		const p = max > 40 ? Math.min(1, Math.max(0, y / max)) : 1;
+		bar.style.transform = `scaleX(${p})`;
+		const title = document.querySelector('.chat-head h1');
+		const cl = document.body.classList;
+		cl.toggle('scrolled', !!title && title.getBoundingClientRect().bottom < 40);
+		// 往上翻时给「回到顶部」，往下读时给「跳到底部」，同一时间只出现一个
+		if (Math.abs(y - lastY) > 4) goingUp = y < lastY;
+		lastY = y;
+		cl.toggle('can-top', goingUp && y > 600);
+		cl.toggle('can-bottom', !goingUp && max - y > 600);
+		if ($toast && y > 400) hideToast(); // 自己往下读了，就不再提示续读
+		if (!save || $toast) return;
+		clearTimeout(saveTimer);
+		saveTimer = setTimeout(flushReading, 400);
+	};
+	const flushReading = () => {
+		clearTimeout(saveTimer);
+		saveTimer = 0;
+		if (!state.current || !document.querySelector('.progress')) return;
+		const max = document.documentElement.scrollHeight - window.innerHeight;
+		if (max <= 40) return; // 一屏以内的短对话没有"读到哪里"可言
+		const p = Math.min(1, Math.max(0, window.scrollY / max));
+		saveReading(state.current.id, { ...(readPos() || {}), p: Math.round(p * 100) });
+	};
+	window.addEventListener('pagehide', () => saveTimer && flushReading());
+	// 跳到某条消息（必要时切到它所在的分支）；带着搜索词时定位到消息里第一处命中
+	const jumpToHit = () => {
+		const mid = state.focusMessage;
+		const q = state.findQuery;
+		state.focusMessage = state.findQuery = null;
+		const { tree } = state.current;
+		if (mid == null || !tree.map[mid]) return false;
+		if (!document.getElementById(`m-${mid}`)) {
+			tree.selectPathTo(mid);
+			renderMessages();
+		}
+		const el = flashMsg(mid);
+		if (!el) return false;
+		if (q) {
+			openFind(q, { focus: false, scroll: false });
+			const i = find.hits.findIndex((hit) => el.contains(hit[0]));
+			if (i >= 0) gotoHit(i);
+			else scrollToEl(el);
+		}
+		hideToast();
+		return true;
+	};
+	window.addEventListener(
+		'scroll',
+		() => {
+			if (scrollRaf) return;
+			scrollRaf = requestAnimationFrame(() => {
+				scrollRaf = 0;
+				updateProgress();
+			});
+		},
+		{ passive: true }
+	);
+	const fab = () =>
+		h(
+			'div',
+			{ class: 'fab' },
+			h('button', { class: 'icon-btn fab-top', title: '回到顶部', 'aria-label': '回到顶部', html: I.toTop, onclick: () => window.scrollTo(0, 0) }),
+			h('button', { class: 'icon-btn fab-bottom', title: '跳到底部', 'aria-label': '跳到底部', html: I.toBottom, onclick: () => window.scrollTo(0, document.documentElement.scrollHeight) })
+		);
+	const msgLink = (mid) => `${location.origin}${location.pathname}#/c/${encodeURIComponent(state.currentId)}/m/${encodeURIComponent(mid)}`;
+
+	async function openChat(id, { quiet = false } = {}) {
+		if (saveTimer) flushReading();
+		closePop();
+		if (!quiet) closeLightbox();
+		hideToast();
 		state.currentId = id;
+		refreshRecents();
 		for (const el of $list.querySelectorAll('.chat-item')) el.classList.toggle('active', el.dataset.id === id);
 		if (!id) {
 			state.current = null;
+			$find = null;
 			document.title = '对话归档';
+			document.body.classList.remove('scrolled', 'can-top', 'can-bottom');
 			setHome(true);
 			const s = state.status;
 			const stat = (n, label) => h('div', { class: 'stat' }, h('div', { class: 'stat-num' }, n), h('div', { class: 'stat-label' }, label));
@@ -1022,15 +1634,24 @@
 		} catch (e) {
 			if (state.currentId === id) {
 				setHome(false);
+				state.current = null;
+				$find = null;
+				document.body.classList.remove('scrolled', 'can-top', 'can-bottom');
 				$main.replaceChildren(topbar(''), h('div', { class: 'welcome' }, h('h1', {}, '无法打开'), h('p', {}, e.message)));
 			}
 			return;
 		}
 		if (state.currentId !== id) return;
+		if (saveTimer) flushReading();
 		setHome(false);
 		const record = data.record;
 		const tree = buildTree(record.chat);
-		state.current = { meta: data, record, tree };
+		// 同步后原地刷新时，保留查找栏的内容
+		const keepFind = quiet && $find && !$find.bar.hidden ? $find.input.value : null;
+		state.current = { id, meta: data, record, tree };
+		find.q = '';
+		find.hits = [];
+		find.idx = -1;
 		if (state.focusMessage && tree.map[state.focusMessage]) {
 			// 让搜索命中的消息所在分支可见
 			tree.selectPathTo(state.focusMessage);
@@ -1066,6 +1687,10 @@
 			)
 		);
 		$messages = h('div', { class: 'messages' });
+		$messages.addEventListener('click', (e) => {
+			// 正文里的图片：页内放大查看
+			if (e.target.matches?.('.md img') && !e.target.closest('a') && e.target.naturalWidth) openLightbox(e.target.currentSrc);
+		});
 		const actions = h(
 			'div',
 			{ class: 'actions' },
@@ -1074,7 +1699,8 @@
 			h('button', { class: 'btn', onclick: () => window.print() }, h('span', { html: I.print }), '打印')
 		);
 		$main.replaceChildren(
-			topbar(record.title),
+			topbar(record.title, true),
+			fab(),
 			h(
 				'div',
 				{ class: 'reader' },
@@ -1084,16 +1710,43 @@
 			)
 		);
 		renderMessages();
-		const target = state.focusMessage && document.getElementById(`m-${state.focusMessage}`);
-		state.focusMessage = null;
-		if (target) {
-			target.scrollIntoView({ block: 'start' });
-			target.classList.add('flash');
-		} else window.scrollTo(0, 0);
+		if (keepFind) openFind(keepFind, { focus: false, scroll: false });
+		lastY = 0;
+		goingUp = false;
+		if (!jumpToHit()) {
+			window.scrollTo(0, 0);
+			const saved = quiet ? null : reading[id]; // 同步后的原地刷新由调用方恢复滚动位置
+			if (saved && state.resume) resumeTo({ ...saved });
+			else if (saved && unfinished(id)) showResume({ ...saved });
+		}
+		state.resume = false;
+		updateProgress(false);
 	}
 
-	const topbar = (title) =>
-		h('div', { class: 'topbar' }, h('button', { class: 'icon-btn', 'aria-label': '打开对话列表', html: I.menu, onclick: openNav }), h('span', { class: 'topbar-title' }, title || '对话归档'));
+	const topbar = (title, tools = false) => {
+		const tool = (name, label, ico, onclick, attrs) => h('button', { class: 'icon-btn', title: label, 'aria-label': label, html: ico, onclick, dataset: { tool: name }, ...attrs });
+		return h(
+			'div',
+			{ class: 'topbar' + (tools ? ' reading' : '') },
+			h(
+				'div',
+				{ class: 'topbar-row' },
+				h('button', { class: 'icon-btn menu-btn', 'aria-label': '打开对话列表', html: I.menu, onclick: openNav }),
+				h('span', { class: 'topbar-title' }, title || '对话归档'),
+				tools
+					? h(
+							'div',
+							{ class: 'tools' },
+							tool('find', '在对话中查找 (F)', I.find, () => ($find.bar.hidden ? openFind() : closeFind()), { 'aria-pressed': 'false' }),
+							tool('outline', '目录 (O)', I.list, () => togglePop('outline'), { 'aria-expanded': 'false' }),
+							tool('settings', '阅读设置', I.type, () => togglePop('settings'), { 'aria-expanded': 'false' })
+						)
+					: null
+			),
+			tools ? findBar() : null,
+			tools ? h('div', { class: 'progress', 'aria-hidden': 'true' }, h('i')) : null
+		);
+	};
 
 	// ───────────── 启动与路由 ─────────────
 	async function loadIndex() {
@@ -1109,14 +1762,28 @@
 		const c = cur && state.byId.get(state.currentId);
 		if (c && (c.updated_at !== cur.record.updated_at || c.missing_upstream !== cur.meta.missing_upstream || c.archived !== cur.meta.archived || c.pinned !== cur.meta.pinned)) {
 			const y = window.scrollY;
-			await openChat(state.currentId);
+			await openChat(state.currentId, { quiet: true });
 			window.scrollTo(0, y);
 		}
 	}
+	const safeDecode = (s) => {
+		try {
+			return decodeURIComponent(s);
+		} catch {
+			return s;
+		}
+	};
+	// #/c/<对话>  或  #/c/<对话>/m/<消息>
 	const route = () => {
-		const m = /^#\/c\/(.+)$/.exec(location.hash);
-		const id = m ? decodeURIComponent(m[1]) : null;
+		const m = /^#\/c\/(.+?)(?:\/m\/([^/]+))?$/.exec(location.hash);
+		const id = m ? safeDecode(m[1]) : null;
+		// 刷新页面或从别的网页返回：回到刚才读到的位置
+		const restore = restoreOnLoad && id != null && !!reading[id];
+		restoreOnLoad = false;
+		if (restore) state.resume = true;
+		else if (m?.[2]) state.focusMessage = safeDecode(m[2]);
 		if (id !== state.currentId || !state.current) openChat(id);
+		else if (m?.[2]) jumpToHit();
 	};
 	async function boot() {
 		renderShell();
@@ -1131,11 +1798,32 @@
 	}
 	window.addEventListener('hashchange', route);
 	document.addEventListener('keydown', (e) => {
-		if (e.key === '/' && !/INPUT|TEXTAREA/.test(document.activeElement?.tagName || '') && $search) {
+		if (e.key === 'Escape') {
+			// 一次只关一层
+			if (closeLightbox()) return;
+			if (navShowing()) return closeNav();
+			if (!closePop() && !closeFind()) closeNav();
+			return;
+		}
+		if (e.ctrlKey || e.metaKey || e.altKey || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '') || !$search?.isConnected) return;
+		if (e.key === '/') {
 			e.preventDefault();
 			openNav();
 			$search.focus();
-		} else if (e.key === 'Escape') closeNav();
+			return;
+		}
+		if (!state.current || $lightbox || navShowing()) return;
+		const run = {
+			j: () => stepMsg(1),
+			k: () => stepMsg(-1),
+			f: () => openFind(),
+			o: () => togglePop('outline'),
+			e: toggleFolds,
+			g: () => window.scrollTo(0, e.shiftKey ? document.documentElement.scrollHeight : 0)
+		}[e.key.length === 1 ? e.key.toLowerCase() : ''];
+		if (!run) return;
+		e.preventDefault();
+		run();
 	});
 	boot();
 })();
