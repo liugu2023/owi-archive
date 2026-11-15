@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS files (
 	fetched_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+-- 阅读位置（跨设备续读）：归档内容本身只读，这是唯一由阅读端写入的数据
+CREATE TABLE IF NOT EXISTS reading (
+	chat_id TEXT PRIMARY KEY,
+	message_id TEXT,
+	rel REAL NOT NULL DEFAULT 0,
+	pct INTEGER NOT NULL DEFAULT 0,
+	t INTEGER NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(
 	chat_id UNINDEXED, message_id UNINDEXED, role UNINDEXED, text, tokenize='trigram'
 );
@@ -93,8 +101,16 @@ const q = {
 		FROM chats ORDER BY updated_at DESC`),
 	listFolders: db.prepare('SELECT id, parent_id, name, missing_upstream FROM folders ORDER BY name'),
 	getChat: db.prepare('SELECT * FROM chats WHERE id = ?'),
-	counts: db.prepare('SELECT COUNT(*) AS chats, COALESCE(SUM(msg_count), 0) AS messages FROM chats')
+	counts: db.prepare('SELECT COUNT(*) AS chats, COALESCE(SUM(msg_count), 0) AS messages FROM chats'),
+	hasChat: db.prepare('SELECT 1 FROM chats WHERE id = ?'),
+	getReading: db.prepare('SELECT message_id, rel, pct, t FROM reading WHERE chat_id = ?'),
+	listReading: db.prepare('SELECT chat_id, message_id, rel, pct, t FROM reading ORDER BY t DESC LIMIT ?'),
+	putReading: db.prepare(`INSERT INTO reading(chat_id, message_id, rel, pct, t) VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id, rel=excluded.rel, pct=excluded.pct, t=excluded.t`),
+	pruneReading: db.prepare('DELETE FROM reading WHERE chat_id NOT IN (SELECT chat_id FROM reading ORDER BY t DESC LIMIT ?)')
 };
+const READING_KEEP = 500; // 服务器上最多保留这么多个对话的阅读位置
+const READING_SEND = 200; // 每次下发给浏览器的数量（最近读过的）
 
 const getMeta = (k, d = null) => q.getMeta.get(k)?.value ?? d;
 const setMeta = (k, v) => q.setMeta.run(k, String(v));
@@ -664,16 +680,53 @@ async function handle(req, res) {
 	if (p.startsWith('/api/') || p.startsWith('/files/')) {
 		if (!authed) return send(res, 401, { error: '未登录' });
 
-		if (p === '/api/sync' && method === 'POST') {
-			// 仅接受同源请求，防止跨站触发
+		// 仅接受同源请求，防止跨站触发
+		const sameOrigin = () => {
 			const origin = req.headers.origin;
-			if (origin && new URL(origin).host !== req.headers.host) return send(res, 403, { error: 'forbidden' });
+			if (!origin) return true;
+			try {
+				return new URL(origin).host === req.headers.host;
+			} catch {
+				return false;
+			}
+		};
+		if (p === '/api/sync' && method === 'POST') {
+			if (!sameOrigin()) return send(res, 403, { error: 'forbidden' });
 			if (!sync.running) runSync();
 			return send(res, 202, syncStatus());
+		}
+		// 记录某个对话读到哪里。各设备的时钟不可靠，所以客户端只报告「这是多久以前读的」（age），
+		// 由服务器换算成自己的时间；比现有记录更早的（比如离线几天后才补传的）不覆盖较新的记录
+		const rd = /^\/api\/reading\/([^/]+)$/.exec(p);
+		if (rd && method === 'PUT') {
+			if (!sameOrigin()) return send(res, 403, { error: 'forbidden' });
+			let body;
+			try {
+				body = JSON.parse(await readBody(req, 2048));
+			} catch {
+				return send(res, 400, { error: '请求格式错误' });
+			}
+			const { m, r, p: pct, age = 0 } = body || {};
+			const okMsg = m == null || (typeof m === 'string' && m.length <= 200);
+			if (!okMsg || !Number.isFinite(r) || r < 0 || r > 1 || !Number.isInteger(pct) || pct < 0 || pct > 100 || !Number.isFinite(age) || age < 0) {
+				return send(res, 400, { error: '请求格式错误' });
+			}
+			if (!q.hasChat.get(rd[1])) return send(res, 404, { error: '对话不存在' });
+			const t = Date.now() - Math.min(Math.floor(age), 365 * 86400000);
+			const cur = q.getReading.get(rd[1]);
+			if (cur && cur.t > t) return send(res, 200, { ok: true, stale: true, reading: { m: cur.message_id, r: cur.rel, p: cur.pct, t: cur.t } });
+			q.putReading.run(rd[1], m ?? null, r, pct, t);
+			q.pruneReading.run(READING_KEEP);
+			return send(res, 200, { ok: true, t });
 		}
 		if (method !== 'GET' && method !== 'HEAD') return send(res, 405, { error: 'method not allowed' });
 
 		if (p === '/api/status') return send(res, 200, syncStatus());
+		if (p === '/api/reading') {
+			const reading = {};
+			for (const r of q.listReading.all(READING_SEND)) reading[r.chat_id] = { m: r.message_id, r: r.rel, p: r.pct, t: r.t };
+			return send(res, 200, { reading });
+		}
 		if (p === '/api/index') {
 			const chats = q.listChats.all().map((c) => ({ ...c, tags: JSON.parse(c.tags), models: JSON.parse(c.models) }));
 			return send(res, 200, { chats, folders: q.listFolders.all(), status: syncStatus() });

@@ -275,11 +275,47 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 		assert.equal(idx.chats.filter((c) => c.missing_upstream).length, 1, '同步失败不应误标删除');
 		assert.equal(idx.chats.length, total + 1);
 
-		// ── 只读：没有任何写接口 ──
+		// ── 归档内容只读：对话没有任何写接口（唯一的写入是下面的阅读位置） ──
 		for (const m of ['POST', 'PUT', 'DELETE', 'PATCH']) {
 			assert.ok([404, 405].includes((await get('/api/chats/plain-0', { method: m })).status), m);
 		}
 		assert.equal((await get('/api/sync', { method: 'POST', headers: { Origin: 'https://evil.example' } })).status, 403, '跨站触发');
+
+		// ── 阅读位置（跨设备续读） ──
+		const putReading = (id, body, headers = {}) => get(`/api/reading/${id}`, { method: 'PUT', body: typeof body === 'string' ? body : JSON.stringify(body), headers });
+		assert.equal((await fetch(base + '/api/reading')).status, 401, '未登录不能读阅读位置');
+		assert.equal((await fetch(base + '/api/reading/plain-0', { method: 'PUT', body: '{"m":"a1","r":0.5,"p":40}' })).status, 401, '未登录不能写阅读位置');
+		assert.deepEqual((await (await get('/api/reading')).json()).reading, {}, '一开始没有记录');
+		r = await putReading('plain-0', { m: 'a1', r: 0.5, p: 40 });
+		assert.equal(r.status, 200);
+		const t1 = (await r.json()).t;
+		assert.ok(Math.abs(t1 - Date.now()) < 5000, '时间由服务器给出');
+		await putReading('plain-1', { m: null, r: 0, p: 100 });
+		let rd = (await (await get('/api/reading')).json()).reading;
+		assert.deepEqual(rd['plain-0'], { m: 'a1', r: 0.5, p: 40, t: t1 });
+		assert.deepEqual(Object.keys(rd), ['plain-1', 'plain-0'], '最近读的在前');
+		await sleep(5);
+		r = await putReading('plain-0', { m: 'a2', r: 0.25, p: 60, t: 1 });
+		const t2 = (await r.json()).t;
+		rd = (await (await get('/api/reading')).json()).reading;
+		assert.ok(t2 > t1 && rd['plain-0'].m === 'a2' && rd['plain-0'].p === 60 && rd['plain-0'].t === t2, '后到的写入覆盖，客户端自带的时间不被采信');
+		// 离线设备补传的旧位置（一小时前读的）不覆盖较新的记录，并拿回当前记录
+		r = await (await putReading('plain-0', { m: 'a1', r: 0.1, p: 10, age: 3600000 })).json();
+		assert.ok(r.stale && r.reading.m === 'a2' && r.reading.p === 60 && r.reading.t === t2, '较旧的位置不覆盖');
+		assert.equal((await (await get('/api/reading')).json()).reading['plain-0'].p, 60);
+		// 没有记录时，补传的旧位置照常写入，时间按 age 往前推
+		r = await (await putReading('plain-2', { m: 'a1', r: 0.1, p: 10, age: 3600000 })).json();
+		assert.ok(!r.stale && Math.abs(Date.now() - 3600000 - r.t) < 5000);
+		assert.equal((await putReading('plain-0', { m: 'a1', r: 0.1, p: 10, age: -5 })).status, 400);
+		assert.equal((await putReading('no-such-chat', { m: 'a1', r: 0, p: 1 })).status, 404, '不存在的对话');
+		for (const bad of ['not json', '{}', '{"m":"a","r":2,"p":10}', '{"m":"a","r":0.5,"p":101}', '{"m":"a","r":0.5,"p":1.5}', '{"m":5,"r":0.5,"p":1}', '{"m":"a","r":"0.5","p":1}', JSON.stringify({ m: 'x'.repeat(201), r: 0, p: 1 })]) {
+			assert.equal((await putReading('plain-0', bad)).status, 400, bad.slice(0, 30));
+		}
+		assert.notEqual((await putReading('plain-0', JSON.stringify({ m: 'x'.repeat(5000), r: 0, p: 1 })).catch(() => ({ status: 0 }))).status, 200, '过大的请求体');
+		assert.equal((await putReading('plain-0', { m: 'a1', r: 0, p: 1 }, { Origin: 'https://evil.example' })).status, 403, '跨站写入');
+		assert.equal((await (await get('/api/reading')).json()).reading['plain-0'].p, 60, '被拒绝的写入不改变记录');
+		for (const m of ['POST', 'DELETE', 'PATCH']) assert.equal((await get('/api/reading/plain-0', { method: m })).status, 405, m);
+		assert.equal((await get('/api/reading', { method: 'PUT', body: '{}' })).status, 405);
 
 		// ── 退出登录 ──
 		r = await get('/api/logout', { method: 'POST' });
