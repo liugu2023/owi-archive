@@ -55,7 +55,9 @@
 		link: icon('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>', 14),
 		prev: icon('<path d="m15 6-6 6 6 6"/>', 20),
 		next: icon('<path d="m9 6 6 6-6 6"/>', 20),
-		panel: icon('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>')
+		panel: icon('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>'),
+		star: icon('<path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8z"/>', 14),
+		filter: icon('<path d="M4 6h16M7 12h10M10 18h4"/>')
 	};
 	const logo = (size) =>
 		h('span', {
@@ -222,6 +224,47 @@
 		} catch {}
 		pushReading();
 		return changed;
+	};
+
+	// ───────────── 收藏的消息（存在服务器上，各设备共用） ─────────────
+	const stars = new Map(); // `${chatId}/${messageId}` -> { chat_id, message_id, role, excerpt, t }
+	const starKey = (chatId, mid) => `${chatId}/${mid}`;
+	const loadStars = async () => {
+		try {
+			const res = await fetch('/api/stars', { credentials: 'same-origin' });
+			if (!res.ok) return;
+			stars.clear();
+			for (const x of (await res.json()).stars) stars.set(starKey(x.chat_id, x.message_id), x);
+		} catch {}
+	};
+	// 先改界面再发请求，失败了改回去
+	const toggleStar = async (chatId, m) => {
+		const key = starKey(chatId, m.id);
+		const had = stars.get(key);
+		const url = `/api/stars/${encodeURIComponent(chatId)}/${encodeURIComponent(m.id)}`;
+		const paint = () => {
+			renderSidebar();
+			if (state.current?.id !== chatId) return;
+			const el = document.getElementById(`m-${m.id}`);
+			const on = stars.has(key);
+			el?.classList.toggle('starred', on);
+			const btn = el?.querySelector('.star-btn');
+			btn?.setAttribute('aria-pressed', String(on));
+			btn?.setAttribute('title', on ? '取消收藏' : '收藏这条消息');
+			btn?.setAttribute('aria-label', on ? '取消收藏' : '收藏这条消息');
+		};
+		const role = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'system';
+		const excerpt = messageText(m).replace(/\s+/g, ' ').trim().slice(0, 200);
+		if (had) stars.delete(key);
+		else stars.set(key, { chat_id: chatId, message_id: String(m.id), role, excerpt, t: Date.now() });
+		paint();
+		try {
+			await api(url, had ? { method: 'DELETE' } : { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ excerpt, role }) });
+		} catch {
+			if (had) stars.set(key, had);
+			else stars.delete(key);
+			paint();
+		}
 	};
 
 	// ───────────── Markdown 渲染 ─────────────
@@ -655,8 +698,12 @@
 		current: null, // { meta, record, tree }
 		focusMessage: null,
 		findQuery: null, // 从搜索结果点进来时，在对话里高亮这个词
-		resume: false // 从「继续阅读」点进来时，直接回到上次的位置
+		resume: false, // 从「继续阅读」点进来时，直接回到上次的位置
+		filter: { model: '', days: 0 }, // 列表 / 搜索结果的筛选
+		filterOpen: false
 	};
+	const filterOn = () => !!(state.filter.model || state.filter.days);
+	const passFilter = (c) => (!state.filter.model || c.models.includes(state.filter.model)) && (!state.filter.days || c.updated_at >= Date.now() / 1000 - state.filter.days * 86400);
 
 	// ───────────── 登录 ─────────────
 	function showLogin() {
@@ -699,7 +746,7 @@
 	}
 
 	// ───────────── 布局 ─────────────
-	let $list, $main, $status, $search, $tabs;
+	let $list, $main, $status, $search, $tabs, $filterBtn, $filters;
 
 	function renderShell() {
 		$search = h('input', { type: 'search', placeholder: '搜索标题和内容…', 'aria-label': '搜索', value: state.query });
@@ -708,6 +755,12 @@
 			clearTimeout(timer);
 			timer = setTimeout(() => doSearch($search.value), 250);
 		});
+		$filterBtn = h('button', { class: 'icon-btn filter-btn', title: '筛选', 'aria-label': '筛选', 'aria-expanded': 'false', html: I.filter });
+		$filterBtn.addEventListener('click', () => {
+			state.filterOpen = !state.filterOpen;
+			renderSidebar();
+		});
+		$filters = h('div', { class: 'filters', hidden: true });
 		$tabs = h('div', { class: 'tabs', role: 'tablist' });
 		$list = h('nav', { class: 'chat-list', 'aria-label': '对话列表' });
 		$status = h('div', { class: 'sync' });
@@ -738,7 +791,8 @@
 				h('button', { class: 'icon-btn side-hide', title: '收起侧栏', 'aria-label': '收起侧栏', html: I.panel, onclick: () => setSide(false) }),
 				h('button', { class: 'icon-btn side-close', title: '关闭对话列表', 'aria-label': '关闭对话列表', html: I.close, onclick: closeNav })
 			),
-			h('label', { class: 'search' }, h('span', { html: I.search }), $search, h('kbd', { class: 'kbd', title: '按 / 聚焦搜索', 'aria-hidden': 'true' }, '/')),
+			h('div', { class: 'search-row' }, h('label', { class: 'search' }, h('span', { html: I.search }), $search, h('kbd', { class: 'kbd', title: '按 / 聚焦搜索', 'aria-hidden': 'true' }, '/')), $filterBtn),
+			$filters,
 			$tabs,
 			$list,
 			$status
@@ -795,7 +849,7 @@
 	};
 	// 侧栏顶部的「继续阅读」：最近读到一半的对话
 	const recentChats = () =>
-		state.results || state.view !== 'active' || state.tag
+		state.results || state.view !== 'active' || state.tag || filterOn()
 			? []
 			: state.chats
 					.filter((c) => !c.archived && unfinished(c.id))
@@ -866,12 +920,72 @@
 		return a;
 	};
 
+	// 搜索结果里某一处命中：点击直接跳到那条消息
+	const hitRow = (c, x) =>
+		h(
+			'a',
+			{
+				class: 'hit-row',
+				href: `#/c/${encodeURIComponent(c.id)}/m/${encodeURIComponent(x.message_id)}`,
+				onclick: (e) => {
+					closeNav();
+					if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+					e.preventDefault();
+					state.focusMessage = x.message_id;
+					state.findQuery = state.query.split(/\s+/)[0];
+					if (c.id === state.currentId && state.current?.id === c.id) jumpToHit();
+					else location.hash = `#/c/${encodeURIComponent(c.id)}`;
+				}
+			},
+			snippetNode(x.snippet)
+		);
+
+	function renderFilters() {
+		$filterBtn.setAttribute('aria-expanded', String(state.filterOpen));
+		$filterBtn.classList.toggle('on', filterOn());
+		$filters.hidden = !state.filterOpen;
+		if (!state.filterOpen) return;
+		// 模型按出现的对话数排序；当前选中的模型即使已经不在归档里也保留在列表中
+		const freq = new Map();
+		for (const c of state.chats) for (const m of c.models) freq.set(m, (freq.get(m) || 0) + 1);
+		if (state.filter.model && !freq.has(state.filter.model)) freq.set(state.filter.model, 0);
+		const select = (label, value, options, onchange) => {
+			const el = h('select', { 'aria-label': label }, options.map(([v, text]) => h('option', { value: v, selected: String(v) === String(value) }, text)));
+			el.addEventListener('change', () => {
+				onchange(el.value);
+				renderSidebar();
+			});
+			return el;
+		};
+		$filters.replaceChildren(
+			select('按模型筛选', state.filter.model, [['', '全部模型'], ...[...freq].sort((a, b) => b[1] - a[1]).map(([m, n]) => [m, `${m}（${n}）`])], (v) => (state.filter.model = v)),
+			select('按时间筛选', state.filter.days, [[0, '全部时间'], [7, '近 7 天'], [30, '近 30 天'], [90, '近 3 个月'], [365, '近一年']], (v) => (state.filter.days = Number(v))),
+			filterOn()
+				? h(
+						'button',
+						{
+							class: 'icon-btn',
+							title: '清除筛选',
+							'aria-label': '清除筛选',
+							html: I.x,
+							onclick: () => {
+								state.filter = { model: '', days: 0 };
+								renderSidebar();
+							}
+						}
+					)
+				: null
+		);
+	}
+
 	function renderSidebar() {
 		const recent = recentChats();
 		recentSig = sigOf(recent);
 		const archivedCount = state.chats.filter((c) => c.archived).length;
 		const missingCount = state.chats.filter((c) => c.missing_upstream).length;
 		if (state.view === 'missing' && !missingCount) state.view = 'active';
+		const starList = [...stars.values()].filter((x) => state.byId.has(x.chat_id)).sort((a, b) => b.t - a.t);
+		if (state.view === 'starred' && !starList.length) state.view = 'active';
 		const tab = (key, label, count) =>
 			h(
 				'button',
@@ -892,6 +1006,7 @@
 			...[
 			tab('active', '对话', state.chats.length - archivedCount),
 			tab('archived', '已归档', archivedCount),
+			starList.length ? tab('starred', '收藏', starList.length) : null,
 			// 只存在于归档里的对话：源站已经删掉了
 			missingCount ? tab('missing', '源站已删除', missingCount) : null,
 			state.tag
@@ -912,27 +1027,65 @@
 			].filter(Boolean)
 		);
 		$tabs.hidden = !!state.results;
+		renderFilters();
 
 		const frag = document.createDocumentFragment();
 		if (state.results) {
-			const hits = state.chats.filter((c) => state.results.has(c.id));
-			frag.append(h('div', { class: 'group-title' }, `找到 ${hits.length} 个对话`));
-			for (const c of hits) frag.append(chatItem(c, state.results.get(c.id)));
-			if (!hits.length) frag.append(h('div', { class: 'empty' }, '没有匹配的内容'));
+			const all = state.chats.filter((c) => state.results.has(c.id));
+			const hits = all.filter(passFilter);
+			frag.append(h('div', { class: 'group-title' }, `找到 ${hits.length} 个对话` + (hits.length < all.length ? `（另有 ${all.length - hits.length} 个被筛选条件排除）` : '')));
+			for (const c of hits) {
+				const hit = state.results.get(c.id);
+				frag.append(chatItem(c, hit));
+				// 同一个对话里的其余命中
+				const more = (hit.hits || []).slice(1);
+				if (more.length) frag.append(h('div', { class: 'hit-list' }, more.map((x) => hitRow(c, x))));
+			}
+			if (!hits.length) frag.append(h('div', { class: 'empty' }, all.length ? '没有符合筛选条件的结果' : '没有匹配的内容'));
+			$list.replaceChildren(frag);
+			return;
+		}
+
+		if (state.view === 'starred') {
+			for (const x of starList) {
+				const c = state.byId.get(x.chat_id);
+				frag.append(
+					h(
+						'a',
+						{
+							class: 'chat-item star-item' + (x.chat_id === state.currentId ? ' active' : ''),
+							href: `#/c/${encodeURIComponent(x.chat_id)}/m/${encodeURIComponent(x.message_id)}`,
+							dataset: { id: x.chat_id },
+							onclick: (e) => {
+								closeNav();
+								if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+								if (state.current?.id !== x.chat_id || state.currentId !== x.chat_id) return;
+								// 已经打开着这个对话：地址可能没变，直接跳过去
+								e.preventDefault();
+								state.focusMessage = x.message_id;
+								jumpToHit();
+							}
+						},
+						h('div', { class: 'snippet' }, x.excerpt || '（图片 / 附件）'),
+						h('div', { class: 'chat-meta' }, `${x.role === 'user' ? '你' : x.role === 'assistant' ? '回答' : '系统'} · ${c.title}`)
+					)
+				);
+			}
 			$list.replaceChildren(frag);
 			return;
 		}
 
 		let chats = state.chats.filter((c) => (state.view === 'missing' ? c.missing_upstream : state.view === 'archived' ? c.archived : !c.archived));
 		if (state.tag) chats = chats.filter((c) => c.tags.includes(state.tag));
+		if (filterOn()) chats = chats.filter(passFilter);
 		if (!chats.length) {
 			$list.replaceChildren(
-				h('div', { class: 'empty' }, state.chats.length ? '这里没有对话' : state.status?.configured ? '尚未同步到任何对话' : '尚未配置同步源')
+				h('div', { class: 'empty' }, filterOn() ? '没有符合筛选条件的对话' : state.chats.length ? '这里没有对话' : state.status?.configured ? '尚未同步到任何对话' : '尚未配置同步源')
 			);
 			return;
 		}
 
-		const flat = state.view !== 'active' || state.tag;
+		const flat = state.view !== 'active' || state.tag || filterOn();
 		if (recent.length) {
 			frag.append(h('div', { class: 'group-title' }, '继续阅读'));
 			for (const c of recent) frag.append(chatItem(c, null, reading[c.id].p));
@@ -1050,6 +1203,7 @@
 				h('div', { class: 'sync-sub' + (s.last_error && !s.running ? ' err' : '') , title: s.last_error || '' },
 					s.last_error && !s.running ? `同步出错：${s.last_error}` : `${s.chats} 个对话 · ${s.messages} 条消息`)
 			),
+			s.chats ? h('a', { class: 'icon-btn export-all', href: '/api/export', download: '', title: '导出全部对话（JSON，可重新导入 Open WebUI）', 'aria-label': '导出全部对话', html: I.download }) : null,
 			btn
 		);
 	}
@@ -1164,9 +1318,19 @@
 		}
 		const who = role === 'user' ? '你' : role === 'assistant' ? m.modelName || m.model || '助手' : '系统';
 		const ts = normTs(m.timestamp);
+		const chatId = state.current.id;
+		const starred = stars.has(starKey(chatId, m.id));
+		const starBtn = h('button', {
+			class: 'icon-btn star-btn',
+			title: starred ? '取消收藏' : '收藏这条消息',
+			'aria-label': starred ? '取消收藏' : '收藏这条消息',
+			'aria-pressed': String(starred),
+			html: I.star,
+			onclick: () => toggleStar(chatId, m)
+		});
 		return h(
 			'article',
-			{ class: `msg ${role}`, id: `m-${m.id}`, dataset: { id: m.id } },
+			{ class: `msg ${role}` + (starred ? ' starred' : ''), id: `m-${m.id}`, dataset: { id: m.id } },
 			h(
 				'header',
 				{ class: 'msg-head' },
@@ -1175,7 +1339,7 @@
 				ts ? h('time', { title: fmtDate(ts) }, fmtDate(ts)) : null
 			),
 			body,
-			h('footer', { class: 'msg-foot' }, branchNav(entry), copyBtn(() => messageText(m), '复制消息'), copyBtn(() => msgLink(m.id), '复制这条消息的链接', I.link))
+			h('footer', { class: 'msg-foot' }, branchNav(entry), copyBtn(() => messageText(m), '复制消息'), copyBtn(() => msgLink(m.id), '复制这条消息的链接', I.link), starBtn)
 		);
 	};
 
@@ -1209,7 +1373,129 @@
 			a.remove();
 		}, 1000);
 	};
+	// 首页概览：近 12 个月新建的对话数、各模型参与的对话数。两张图都只有一个系列，用同一种颜色表示数量
+	const overview = () => {
+		if (state.chats.length < 2) return null;
+		const now = new Date();
+		const months = Array.from({ length: 12 }, (_, i) => {
+			const d = new Date(now.getFullYear(), now.getMonth() - 11 + i, 1);
+			return { y: d.getFullYear(), m: d.getMonth() + 1, n: 0 };
+		});
+		const slot = new Map(months.map((x) => [`${x.y}-${x.m}`, x]));
+		const freq = new Map();
+		for (const c of state.chats) {
+			const d = new Date(c.created_at * 1000);
+			const x = slot.get(`${d.getFullYear()}-${d.getMonth() + 1}`);
+			if (x) x.n++;
+			for (const m of c.models) freq.set(m, (freq.get(m) || 0) + 1);
+		}
+		const peak = Math.max(1, ...months.map((x) => x.n));
+		const peakAt = months.findIndex((x) => x.n === peak);
+		const monthly = h(
+			'section',
+			{ class: 'viz' },
+			h('h2', {}, '近 12 个月新建的对话'),
+			h(
+				'div',
+				{ class: 'bars', role: 'img', 'aria-label': months.map((x) => `${x.y} 年 ${x.m} 月 ${x.n} 个`).join('，') },
+				months.map((x, i) =>
+					h(
+						'div',
+						{ class: 'bar-col', title: `${x.y} 年 ${x.m} 月：${x.n} 个对话` },
+						// 只给最高的一根标数值，其余悬停查看
+						// 柱子单独占一个绘图区，高度才是相对同一个基准的百分比
+						h('span', { class: 'bar-plot' }, i === peakAt && x.n ? h('span', { class: 'bar-val' }, x.n) : null, h('i', { class: x.n ? '' : 'zero', style: `height:${x.n ? Math.max(2, (x.n / peak) * 100) : 0}%` })),
+						h('span', { class: 'bar-x' }, i === 0 || x.m === 1 ? `${String(x.y).slice(2)}/${x.m}` : x.m)
+					)
+				)
+			)
+		);
+		const ranked = [...freq].sort((a, b) => b[1] - a[1]);
+		const top = ranked.slice(0, 6);
+		const rest = ranked.slice(6);
+		const max = top[0]?.[1] || 1;
+		const models = top.length
+			? h(
+					'section',
+					{ class: 'viz' },
+					h('h2', {}, '各模型参与的对话'),
+					h(
+						'div',
+						{ class: 'hbars' },
+						top.map(([name, n]) =>
+							h(
+								'button',
+								{
+									class: 'hbar',
+									title: `只看 ${name} 的对话`,
+									onclick: () => {
+										state.filter.model = name;
+										state.filterOpen = true;
+										state.view = 'active';
+										renderSidebar();
+										openNav();
+									}
+								},
+								h('span', { class: 'hbar-name' }, name),
+								h('span', { class: 'hbar-track' }, h('i', { style: `width:${Math.max(1, (n / max) * 100)}%` })),
+								h('span', { class: 'hbar-val' }, n)
+							)
+						)
+					),
+					rest.length ? h('p', { class: 'viz-note' }, `另有 ${rest.length} 个模型，共参与 ${rest.reduce((a, x) => a + x[1], 0)} 个对话`) : null
+				)
+			: null;
+		return h('div', { class: 'overview' }, monthly, models, statsSection());
+	};
 	const sizeText = (n) => (n < 500 ? null : n < 10000 ? `约 ${Math.round(n / 100) * 100} 字` : `约 ${(n / 10000).toFixed(1)} 万字`);
+	// 字数按中文习惯：每个汉字算 1 个字，一串连续的字母 / 数字算 1 个词，标点和空白不计（与服务端 measure 一致）
+	const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\u{20000}-\u{2fa1f}]/gu;
+	const countChars = (text) => {
+		const cjk = (text.match(CJK_RE) || []).length;
+		return cjk + (text.replace(CJK_RE, ' ').match(/[\p{L}\p{N}]+(?:['’._-][\p{L}\p{N}]+)*/gu) || []).length;
+	};
+	const big = (n) => (n < 10000 ? String(Math.round(n)) : n < 1e8 ? `${(n / 1e4).toFixed(n < 1e5 ? 2 : 1)} 万` : `${(n / 1e8).toFixed(2)} 亿`);
+	// 字数与 token 统计：服务端算，首页异步填进来
+	const statsSection = () => {
+		const box = h('section', { class: 'viz usage', hidden: true });
+		api('/api/stats')
+			.then((st) => {
+				if (!st.models.length) return;
+				const chars = st.user.chars + st.models.reduce((n, m) => n + m.chars, 0);
+				const tile = document.querySelector('.stat-chars .stat-num');
+				if (tile) tile.textContent = big(chars);
+				const anyEst = st.models.some((m) => m.reported < m.messages);
+				const tok = (m, k) => h('td', { title: m.reported < m.messages ? `${m.messages} 条回答里有 ${m.messages - m.reported} 条上游没有返回用量，按模型估算` : '上游返回的用量' }, (m.reported < m.messages ? '≈ ' : '') + big(m[k]));
+				const sum = (k) => st.models.reduce((n, m) => n + m[k], 0);
+				box.replaceChildren(
+					h('h2', {}, '字数与 token 用量'),
+					h(
+						'div',
+						{ class: 'table-wrap usage-wrap' },
+						h(
+							'table',
+							{},
+							h('thead', {}, h('tr', {}, ['模型', '回答', '字数', '输入 token', '输出 token'].map((t) => h('th', {}, t)))),
+							h(
+								'tbody',
+								{},
+								st.models.map((m) => h('tr', {}, h('th', { title: m.name }, m.name), h('td', {}, m.messages), h('td', {}, big(m.chars)), tok(m, 'input'), tok(m, 'output')))
+							),
+							h(
+								'tfoot',
+								{},
+								h('tr', {}, h('th', {}, '你的提问'), h('td', {}, st.user.messages), h('td', {}, big(st.user.chars)), h('td', {}, '—'), h('td', {}, '—')),
+								h('tr', {}, h('th', {}, '合计'), h('td', {}, sum('messages') + st.user.messages), h('td', {}, big(chars)), h('td', {}, (anyEst ? '≈ ' : '') + big(sum('input'))), h('td', {}, (anyEst ? '≈ ' : '') + big(sum('output'))))
+							)
+						)
+					),
+					h('p', { class: 'viz-note' }, '字数：每个汉字算 1 字，连续的字母或数字算 1 词，不计标点；所有分支都算在内。' + (anyEst ? '带 ≈ 的 token 数含估算：上游没有返回用量的回答，按模型所属的分词器家族由文本折算，输入按当时的全部上文计。' : 'token 数均为上游返回的用量。'))
+				);
+				box.hidden = false;
+			})
+			.catch(() => {});
+		return box;
+	};
 	const safeName = (s) => String(s).replace(/[\\/:*?"<>|\n\r]+/g, ' ').trim().slice(0, 80) || 'chat';
 	const toMarkdown = () => {
 		const { record, tree } = state.current;
@@ -1826,7 +2112,7 @@
 			document.body.classList.remove('scrolled', 'can-top', 'can-bottom', 'reading');
 			setHome(true);
 			const s = state.status;
-			const stat = (n, label) => h('div', { class: 'stat' }, h('div', { class: 'stat-num' }, n), h('div', { class: 'stat-label' }, label));
+			const stat = (n, label, cls = '') => h('div', { class: `stat ${cls}` }, h('div', { class: 'stat-num' }, n), h('div', { class: 'stat-label' }, label));
 			$main.replaceChildren(
 				topbar(''),
 				h(
@@ -1834,8 +2120,9 @@
 					{ class: 'welcome' },
 					h('div', { class: 'welcome-mark', html: I.archive }),
 					h('h1', {}, '对话归档'),
-					s ? h('div', { class: 'stats' }, stat(s.chats, '个对话'), stat(s.messages, '条消息')) : null,
-					h('p', { class: 'dim' }, '从左侧选择一个对话开始阅读，或直接搜索全文。')
+					s ? h('div', { class: 'stats' }, stat(s.chats, '个对话'), stat(s.messages, '条消息'), state.chats.length > 1 ? stat('…', '字', 'stat-chars') : null) : null,
+					h('p', { class: 'dim' }, '从左侧选择一个对话开始阅读，或直接搜索全文。'),
+					overview()
 				)
 			);
 			return;
@@ -1882,7 +2169,7 @@
 			fmtDate(record.created_at),
 			record.updated_at !== record.created_at ? `更新于 ${fmtDate(record.updated_at)}` : null,
 			`${pathLen} 条消息${tree.total > pathLen ? `（含其他分支共 ${tree.total} 条）` : ''}`,
-			sizeText(tree.path().reduce((n, e) => n + [...messageText(e.msg).replace(/\s+/g, '')].length, 0)),
+			sizeText(tree.path().reduce((n, e) => n + countChars(messageText(e.msg)), 0)),
 			folder ? `文件夹：${folder.name}` : null
 		].filter(Boolean);
 		const tags = (data.tags || []).map((t) =>
@@ -2023,7 +2310,7 @@
 		renderShell();
 		try {
 			// 阅读位置和对话列表一起取；取不到也不影响阅读
-			await Promise.all([loadIndex(), pullReading()]);
+			await Promise.all([loadIndex(), pullReading(), loadStars()]);
 		} catch {
 			return;
 		}

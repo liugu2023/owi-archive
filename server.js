@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 -- 阅读位置（跨设备续读）：归档内容本身只读，这是唯一由阅读端写入的数据
+-- 收藏的消息：摘录由阅读端在收藏时提供，列表页不必再去翻原始 JSON
+CREATE TABLE IF NOT EXISTS stars (
+	chat_id TEXT NOT NULL,
+	message_id TEXT NOT NULL,
+	role TEXT NOT NULL DEFAULT '',
+	excerpt TEXT NOT NULL DEFAULT '',
+	t INTEGER NOT NULL,
+	PRIMARY KEY (chat_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS reading (
 	chat_id TEXT PRIMARY KEY,
 	message_id TEXT,
@@ -103,6 +112,13 @@ const q = {
 	getChat: db.prepare('SELECT * FROM chats WHERE id = ?'),
 	counts: db.prepare('SELECT COUNT(*) AS chats, COALESCE(SUM(msg_count), 0) AS messages FROM chats'),
 	hasChat: db.prepare('SELECT 1 FROM chats WHERE id = ?'),
+	listStars: db.prepare('SELECT chat_id, message_id, role, excerpt, t FROM stars ORDER BY t DESC LIMIT 2000'),
+	putStar: db.prepare(`INSERT INTO stars(chat_id, message_id, role, excerpt, t) VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(chat_id, message_id) DO UPDATE SET role=excluded.role, excerpt=excluded.excerpt`),
+	delStar: db.prepare('DELETE FROM stars WHERE chat_id = ? AND message_id = ?'),
+	countStars: db.prepare('SELECT COUNT(*) AS n FROM stars'),
+	statsRows: db.prepare('SELECT id, updated_at, data FROM chats'),
+	allChatData: db.prepare('SELECT data FROM chats ORDER BY updated_at DESC'),
 	getReading: db.prepare('SELECT message_id, rel, pct, t FROM reading WHERE chat_id = ?'),
 	listReading: db.prepare('SELECT chat_id, message_id, rel, pct, t FROM reading ORDER BY t DESC LIMIT ?'),
 	putReading: db.prepare(`INSERT INTO reading(chat_id, message_id, rel, pct, t) VALUES(?, ?, ?, ?, ?)
@@ -152,6 +168,133 @@ function searchableText(msg) {
 		.join('\n')
 		.replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')
 		.trim();
+}
+
+// ───────────────────────── 统计：字数与 token ─────────────────────────
+// 字数按中文习惯：每个汉字（含假名、谚文）算 1 个字，一串连续的字母 / 数字算 1 个词，标点和空白不计
+const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\u{20000}-\u{2fa1f}]/gu;
+function measure(text) {
+	if (!text) return { cjk: 0, words: 0, other: 0 };
+	const cjk = (text.match(CJK_RE) || []).length;
+	const rest = text.replace(CJK_RE, ' ');
+	const words = (rest.match(/[\p{L}\p{N}]+(?:['’._-][\p{L}\p{N}]+)*/gu) || []).length;
+	const other = rest.replace(/\s+/g, ' ').length; // 非汉字部分的字符数，估算 token 用
+	return { cjk, words, other };
+}
+// 上游没有返回用量时，按模型所属的分词器家族估算：[匹配规则, 每个汉字约合多少 token, 每个其他字符约合多少 token]。
+// 这些系数是粗略的经验值，不是真实分词结果；觉得偏了就改这张表。排在前面的规则优先
+const TOKEN_FAMILIES = [
+	[/gpt-4o|gpt-4\.1|gpt-4\.5|gpt-5|chatgpt|\bo[134](-|$)/i, 0.8, 0.25],
+	[/gpt-|davinci|text-embedding/i, 1.2, 0.25],
+	[/claude/i, 1.2, 0.29],
+	[/gemini|gemma|palm/i, 0.7, 0.25],
+	[/deepseek/i, 0.6, 0.3],
+	[/qwen|tongyi|glm|zhipu|moonshot|kimi|doubao|ernie|wenxin|hunyuan|yi-|minimax|abab|spark|baichuan/i, 0.65, 0.27],
+	[/grok/i, 0.8, 0.25],
+	[/llama|mistral|mixtral|phi-|command-r/i, 1.1, 0.27]
+];
+const TOKEN_DEFAULT = [1, 0.27];
+const familyOf = (model) => {
+	const f = TOKEN_FAMILIES.find(([re]) => re.test(model));
+	return f ? [f[1], f[2]] : TOKEN_DEFAULT;
+};
+const estTokens = (ms, fam) => ms.cjk * fam[0] + ms.other * fam[1];
+const num = (v) => (Number.isFinite(v) && v >= 0 ? v : null);
+// Open WebUI 原样保存上游的 usage，字段名因上游而异（OpenAI / Anthropic / Ollama）
+function usageOf(m) {
+	const u = m.usage || m.info?.usage || m.info;
+	if (!u || typeof u !== 'object') return null;
+	const input = num(u.prompt_tokens) ?? num(u.input_tokens) ?? num(u.prompt_eval_count);
+	const output = num(u.completion_tokens) ?? num(u.output_tokens) ?? num(u.eval_count);
+	return input == null && output == null ? null : { input, output };
+}
+function reasoningText(m) {
+	if (!Array.isArray(m.output)) return '';
+	return m.output
+		.filter((it) => it?.type === 'reasoning')
+		.map((it) => textOfContent(it.summary?.length ? it.summary : it.content))
+		.join('\n');
+}
+// 一个对话的统计。所有分支都算：重新生成的回答同样写过字、花过 token
+function chatStats(body) {
+	let map = body?.history?.messages;
+	if (!map || !Object.keys(map).length) {
+		map = {};
+		let prev = null;
+		for (const [i, m] of (body?.messages || []).entries()) {
+			const id = String(m.id ?? `m${i}`);
+			map[id] = { ...m, parentId: m.parentId !== undefined ? m.parentId : prev };
+			prev = id;
+		}
+	}
+	const ms = new Map();
+	for (const [id, m] of Object.entries(map)) ms.set(id, measure(textOfContent(m.content).replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')));
+	// 某条消息之前的全部上文（沿父消息一路往上），即生成它时发给模型的内容
+	const ctx = new Map();
+	const context = (id) => {
+		const chain = [];
+		for (let cur = id; cur != null && map[cur] && !ctx.has(cur) && chain.length < 100000; cur = map[cur].parentId) chain.push(cur);
+		for (const cur of chain.reverse()) {
+			const p = map[cur].parentId;
+			const base = p != null && ctx.has(p) ? ctx.get(p) : { cjk: 0, other: 0 };
+			const own = p != null && ms.has(p) ? ms.get(p) : { cjk: 0, other: 0 };
+			ctx.set(cur, { cjk: base.cjk + own.cjk, other: base.other + own.other });
+		}
+		return ctx.get(id) || { cjk: 0, other: 0 };
+	};
+	const out = { user: { chars: 0, messages: 0 }, models: {} };
+	for (const [id, m] of Object.entries(map)) {
+		const own = ms.get(id);
+		const chars = own.cjk + own.words;
+		if (m.role === 'user') {
+			out.user.chars += chars;
+			out.user.messages++;
+			continue;
+		}
+		if (m.role !== 'assistant') continue;
+		const name = typeof (m.modelName || m.model) === 'string' ? m.modelName || m.model : '未知模型';
+		const a = (out.models[name] ||= { chars: 0, messages: 0, input: 0, output: 0, reported: 0 });
+		a.chars += chars;
+		a.messages++;
+		const fam = familyOf(`${m.model || ''} ${m.modelName || ''}`);
+		const u = usageOf(m);
+		if (u) a.reported++;
+		// 输出包含思考内容；上游给了数就用上游的，缺哪项估哪项
+		const think = measure(reasoningText(m));
+		a.output += u?.output ?? estTokens({ cjk: own.cjk + think.cjk, other: own.other + think.other }, fam);
+		a.input += u?.input ?? estTokens(context(id), fam);
+	}
+	return out;
+}
+const statsCache = new Map(); // chat id -> { updated_at, stats }
+function archiveStats() {
+	const seen = new Set();
+	const total = { user: { chars: 0, messages: 0 }, models: {} };
+	for (const row of q.statsRows.iterate()) {
+		seen.add(row.id);
+		let c = statsCache.get(row.id);
+		if (!c || c.updated_at !== row.updated_at) {
+			let st;
+			try {
+				st = chatStats(JSON.parse(row.data).chat);
+			} catch {
+				st = { user: { chars: 0, messages: 0 }, models: {} };
+			}
+			statsCache.set(row.id, (c = { updated_at: row.updated_at, stats: st }));
+		}
+		total.user.chars += c.stats.user.chars;
+		total.user.messages += c.stats.user.messages;
+		for (const [name, a] of Object.entries(c.stats.models)) {
+			const t = (total.models[name] ||= { chats: 0, chars: 0, messages: 0, input: 0, output: 0, reported: 0 });
+			t.chats++;
+			for (const k of ['chars', 'messages', 'input', 'output', 'reported']) t[k] += a[k];
+		}
+	}
+	for (const id of statsCache.keys()) if (!seen.has(id)) statsCache.delete(id);
+	const models = Object.entries(total.models)
+		.map(([name, a]) => ({ name, ...a, input: Math.round(a.input), output: Math.round(a.output) }))
+		.sort((a, b) => b.output + b.input - (a.output + a.input));
+	return { user: total.user, models };
 }
 
 const FILE_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -579,6 +722,7 @@ function ftsPhrase(s) {
 	return '"' + s.replace(/"/g, '""') + '"';
 }
 
+const HITS_PER_CHAT = 5;
 function search(query) {
 	const terms = query.split(/\s+/).filter(Boolean).slice(0, 8);
 	if (!terms.length) return [];
@@ -618,15 +762,18 @@ function search(query) {
 	}
 	for (const r of rows) {
 		const h = hits.get(r.chat_id);
-		if (h) h.count++;
-		else hits.set(r.chat_id, { snippet: r.snip, message_id: r.message_id, count: 1 });
+		if (!h) hits.set(r.chat_id, { snippet: r.snip, message_id: r.message_id, count: 1, hits: [{ message_id: r.message_id, role: r.role, snippet: r.snip }] });
+		else {
+			h.count++;
+			if (h.hits.length < HITS_PER_CHAT) h.hits.push({ message_id: r.message_id, role: r.role, snippet: r.snip });
+		}
 	}
 	// 标题命中
 	const titleWhere = terms.map(() => "title LIKE ? ESCAPE '\\'").join(' AND ');
 	const titleRows = db
 		.prepare(`SELECT id FROM chats WHERE ${titleWhere}`)
 		.all(...terms.map((t) => '%' + t.replace(/[\\%_]/g, '\\$&') + '%'));
-	for (const r of titleRows) if (!hits.has(r.id)) hits.set(r.id, { snippet: null, message_id: null, count: 0 });
+	for (const r of titleRows) if (!hits.has(r.id)) hits.set(r.id, { snippet: null, message_id: null, count: 0, hits: [] });
 	return [...hits].map(([id, h]) => ({ id, ...h }));
 }
 
@@ -695,6 +842,28 @@ async function handle(req, res) {
 			if (!sync.running) runSync();
 			return send(res, 202, syncStatus());
 		}
+		// 收藏 / 取消收藏一条消息
+		const st = /^\/api\/stars\/([^/]+)\/([^/]+)$/.exec(p);
+		if (st && (method === 'PUT' || method === 'DELETE')) {
+			if (!sameOrigin()) return send(res, 403, { error: 'forbidden' });
+			if (method === 'DELETE') {
+				q.delStar.run(st[1], st[2]);
+				return send(res, 200, { ok: true });
+			}
+			let body;
+			try {
+				body = JSON.parse(await readBody(req, 4096));
+			} catch {
+				return send(res, 400, { error: '请求格式错误' });
+			}
+			const { excerpt = '', role = '' } = body || {};
+			if (typeof excerpt !== 'string' || typeof role !== 'string' || st[2].length > 200) return send(res, 400, { error: '请求格式错误' });
+			if (!q.hasChat.get(st[1])) return send(res, 404, { error: '对话不存在' });
+			if (q.countStars.get().n >= 2000) return send(res, 409, { error: '收藏已达上限（2000 条）' });
+			const t = Date.now();
+			q.putStar.run(st[1], st[2], role.slice(0, 20), [...excerpt].slice(0, 200).join(''), t);
+			return send(res, 200, { ok: true, t });
+		}
 		// 记录某个对话读到哪里。各设备的时钟不可靠，所以客户端只报告「这是多久以前读的」（age），
 		// 由服务器换算成自己的时间；比现有记录更早的（比如离线几天后才补传的）不覆盖较新的记录
 		const rd = /^\/api\/reading\/([^/]+)$/.exec(p);
@@ -722,6 +891,25 @@ async function handle(req, res) {
 		if (method !== 'GET' && method !== 'HEAD') return send(res, 405, { error: 'method not allowed' });
 
 		if (p === '/api/status') return send(res, 200, syncStatus());
+		if (p === '/api/stats') return send(res, 200, archiveStats());
+		if (p === '/api/stars') return send(res, 200, { stars: q.listStars.all() });
+		// 整个归档导出为一个 JSON 数组（每项是 Open WebUI 的原始对话对象，可重新导入）
+		if (p === '/api/export') {
+			res.writeHead(200, {
+				...SECURITY_HEADERS,
+				'Content-Type': 'application/json; charset=utf-8',
+				'Content-Disposition': `attachment; filename="owui-archive-${new Date().toISOString().slice(0, 10)}.json"`,
+				'Cache-Control': 'no-store'
+			});
+			if (method === 'HEAD') return res.end();
+			res.write('[');
+			let first = true;
+			for (const row of q.allChatData.iterate()) {
+				if (!res.write((first ? '' : ',\n') + row.data)) await new Promise((r) => res.once('drain', r));
+				first = false;
+			}
+			return res.end(']');
+		}
 		if (p === '/api/reading') {
 			const reading = {};
 			for (const r of q.listReading.all(READING_SEND)) reading[r.chat_id] = { m: r.message_id, r: r.rel, p: r.pct, t: r.t };

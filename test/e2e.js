@@ -52,6 +52,17 @@ up.chats.set('pin-0', mkChat('pin-0', '置顶对话', 1700004000, { pinned: true
 up.chats.set('pin-f', mkChat('pin-f', '文件夹里的置顶', 1700004100, { pinned: true, folder_id: 'f1' }));
 up.chats.set('arch-f', mkChat('arch-f', '文件夹里的归档', 1700004200, { archived: true, folder_id: 'f1' }));
 up.chats.set(
+	'stats-0',
+	mkChat('stats-0', '统计用', 1700006000, {}, {
+		// 独立的系统消息：不计入统计，只为让全文搜索的既有断言照常命中这个对话
+		s0: { id: 's0', parentId: null, childrenIds: [], role: 'system', content: 'pineapple 量子纠缠', timestamp: 1699999999 },
+		u1: { id: 'u1', parentId: null, childrenIds: ['a1', 'a2', 'a3'], role: 'user', content: '你好，world 2024！请写一个 hello-world。', timestamp: 1700000000 },
+		a1: { id: 'a1', parentId: 'u1', childrenIds: [], role: 'assistant', model: 'claude-x', content: '好的，这是答案 answer。', usage: { prompt_tokens: 321, completion_tokens: 123, total_tokens: 444 }, timestamp: 1700000001 },
+		a2: { id: 'a2', parentId: 'u1', childrenIds: [], role: 'assistant', model: 'gpt-4o-mini', content: '第二个版本', timestamp: 1700000002 },
+		a3: { id: 'a3', parentId: 'u1', childrenIds: [], role: 'assistant', model: 'deepseek-chat', content: '第三个版本', usage: { eval_count: 50 }, timestamp: 1700000003 }
+	})
+);
+up.chats.set(
 	'files-0',
 	mkChat('files-0', '带附件', 1700005000, { meta: { tags: ['图片'] } }, {
 		u1: { id: 'u1', parentId: null, childrenIds: ['a1'], role: 'user', content: '看图', files: [{ type: 'image', url: FILE_ID }], timestamp: 1700000000 },
@@ -316,6 +327,69 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 		assert.equal((await (await get('/api/reading')).json()).reading['plain-0'].p, 60, '被拒绝的写入不改变记录');
 		for (const m of ['POST', 'DELETE', 'PATCH']) assert.equal((await get('/api/reading/plain-0', { method: m })).status, 405, m);
 		assert.equal((await get('/api/reading', { method: 'PUT', body: '{}' })).status, 405);
+
+		// ── 收藏 ──
+		const star = (path, method, body, headers = {}) => get(`/api/stars/${path}`, { method, body: body === undefined ? undefined : JSON.stringify(body), headers });
+		assert.equal((await fetch(base + '/api/stars')).status, 401);
+		assert.equal((await fetch(base + '/api/stars/plain-0/a1', { method: 'PUT', body: '{}' })).status, 401);
+		assert.deepEqual((await (await get('/api/stars')).json()).stars, []);
+		assert.equal((await star('plain-0/a1', 'PUT', { excerpt: '第一版回答', role: 'assistant' })).status, 200);
+		await sleep(3);
+		assert.equal((await star('plain-1/u1', 'PUT', { excerpt: '长'.repeat(500), role: 'user' })).status, 200);
+		let stars = (await (await get('/api/stars')).json()).stars;
+		assert.deepEqual(stars.map((x) => `${x.chat_id}/${x.message_id}`), ['plain-1/u1', 'plain-0/a1'], '最近收藏的在前');
+		assert.equal([...stars[0].excerpt].length, 200, '摘录截断到 200 字');
+		const firstT = stars[1].t;
+		await star('plain-0/a1', 'PUT', { excerpt: '改过的摘录', role: 'assistant' });
+		stars = (await (await get('/api/stars')).json()).stars;
+		assert.ok(stars.length === 2 && stars[1].excerpt === '改过的摘录' && stars[1].t === firstT, '重复收藏不产生新记录，也不改变收藏时间');
+		assert.equal((await star('nope/a1', 'PUT', { excerpt: 'x' })).status, 404);
+		assert.equal((await star('plain-0/a1', 'PUT', { excerpt: 5 })).status, 400);
+		assert.equal((await get('/api/stars/plain-0/a1', { method: 'PUT', body: 'nope' })).status, 400);
+		assert.equal((await star('plain-0/a2', 'PUT', { excerpt: 'x' }, { Origin: 'https://evil.example' })).status, 403);
+		assert.equal((await star('plain-0/a1', 'DELETE', undefined, { Origin: 'https://evil.example' })).status, 403);
+		assert.equal((await star('plain-0/a1', 'DELETE')).status, 200);
+		assert.equal((await star('plain-0/a1', 'DELETE')).status, 200, '重复取消不报错');
+		assert.equal((await (await get('/api/stars')).json()).stars.length, 1);
+		assert.equal((await get('/api/stars/plain-0/a1', { method: 'POST' })).status, 405);
+
+		// ── 搜索：每个对话返回多处命中 ──
+		r = (await (await get('/api/search?q=' + encodeURIComponent('pineapple'))).json()).results.find((x) => x.id === 'plain-5');
+		assert.ok(r.hits.length === 1 && r.hits[0].message_id === r.message_id && r.hits[0].role === 'assistant' && r.hits[0].snippet === r.snippet);
+		r = (await (await get('/api/search?q=' + encodeURIComponent('回答'))).json()).results.find((x) => x.id === 'plain-0');
+		assert.ok(r.count === 2 && r.hits.length === 2 && new Set(r.hits.map((x) => x.message_id)).size === 2, '一个对话里的两处命中分别列出');
+
+		// ── 统计：字数与 token ──
+		assert.equal((await fetch(base + '/api/stats')).status, 401);
+		const stats = await (await get('/api/stats')).json();
+		const sm = Object.fromEntries(stats.models.map((x) => [x.name, x]));
+		// stats-0：用户「你好，world 2024！请写一个 hello-world。」= 6 个汉字 + world / 2024 / hello-world 3 个词
+		// claude-x 回答「好的，这是答案 answer。」= 6 字 + 1 词，上游报了用量；gpt-4o 回答（另一分支）「第二个版本」= 5 字，没有用量
+		assert.equal(sm['claude-x'].chars, 7);
+		assert.deepEqual([sm['claude-x'].input, sm['claude-x'].output, sm['claude-x'].reported, sm['claude-x'].messages, sm['claude-x'].chats], [321, 123, 1, 1, 1], '上游报了用量就原样采用');
+		assert.equal(sm['gpt-4o-mini'].chars, 5);
+		assert.equal(sm['gpt-4o-mini'].reported, 0);
+		assert.equal(sm['gpt-4o-mini'].output, Math.round(5 * 0.8), '没有用量时按模型家族估算输出');
+		// 输入 = 上文（那条用户消息）：6 个汉字 + 其余部分折成的字符
+		const restLen = '你好，world 2024！请写一个 hello-world。'.replace(/[\u4e00-\u9fff]/g, ' ').replace(/\s+/g, ' ').length;
+		assert.equal(sm['gpt-4o-mini'].input, Math.round(6 * 0.8 + restLen * 0.25), '输入按上文估算');
+		// 只报了输出、没报输入：输出用上游的，输入估算，仍算作有上报
+		assert.deepEqual([sm['deepseek-chat'].output, sm['deepseek-chat'].reported], [50, 1]);
+		assert.equal(sm['deepseek-chat'].input, Math.round(6 * 0.6 + restLen * 0.3));
+		// 用户字数：stats-0 那条是 6 字 + 3 词 = 9；其余每个对话的提问「关于<标题>的问题」全是汉字和数字
+		const one = (await (await get('/api/chats/stats-0')).json()).record;
+		assert.ok(one.chat.history.messages.u1);
+		const userChars = stats.user.chars;
+		assert.equal((await (await get('/api/stats')).json()).user.chars, userChars, '重复请求结果一致（走缓存）');
+		assert.ok(userChars >= 10 && stats.user.messages >= idx.chats.length);
+
+		// ── 导出整个归档 ──
+		assert.equal((await fetch(base + '/api/export')).status, 401);
+		r = await get('/api/export');
+		assert.match(r.headers.get('content-disposition'), /attachment; filename="owui-archive-\d{4}-\d\d-\d\d\.json"/);
+		const all = await r.json();
+		assert.equal(all.length, idx.chats.length, '导出包含全部对话（含源站已删除的）');
+		assert.ok(all.every((c) => c.id && c.chat?.history?.messages), '每项是完整的原始对话对象');
 
 		// ── 退出登录 ──
 		r = await get('/api/logout', { method: 'POST' });
