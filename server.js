@@ -117,7 +117,8 @@ const q = {
 		ON CONFLICT(chat_id, message_id) DO UPDATE SET role=excluded.role, excerpt=excluded.excerpt`),
 	delStar: db.prepare('DELETE FROM stars WHERE chat_id = ? AND message_id = ?'),
 	countStars: db.prepare('SELECT COUNT(*) AS n FROM stars'),
-	statsRows: db.prepare('SELECT id, updated_at, data FROM chats'),
+	statsIndex: db.prepare('SELECT id, updated_at FROM chats'),
+	statsData: db.prepare('SELECT data FROM chats WHERE id = ?'),
 	allChatData: db.prepare('SELECT data FROM chats ORDER BY updated_at DESC'),
 	getReading: db.prepare('SELECT message_id, rel, pct, t FROM reading WHERE chat_id = ?'),
 	listReading: db.prepare('SELECT chat_id, message_id, rel, pct, t FROM reading ORDER BY t DESC LIMIT ?'),
@@ -270,13 +271,14 @@ const statsCache = new Map(); // chat id -> { updated_at, stats }
 function archiveStats() {
 	const seen = new Set();
 	const total = { user: { chars: 0, messages: 0 }, models: {} };
-	for (const row of q.statsRows.iterate()) {
+	// 只有新的、改过的对话才去读正文，其余用上次算好的
+	for (const row of q.statsIndex.all()) {
 		seen.add(row.id);
 		let c = statsCache.get(row.id);
 		if (!c || c.updated_at !== row.updated_at) {
 			let st;
 			try {
-				st = chatStats(JSON.parse(row.data).chat);
+				st = chatStats(JSON.parse(q.statsData.get(row.id).data).chat);
 			} catch {
 				st = { user: { chars: 0, messages: 0 }, models: {} };
 			}
@@ -609,12 +611,13 @@ const safeEqual = (a, b) => {
 	return crypto.timingSafeEqual(x, y);
 };
 
+// 已登录时返回会话的到期时间（毫秒时间戳），否则返回 0
 function isAuthed(req) {
 	const m = new RegExp(`(?:^|;\\s*)${COOKIE}=([^;]+)`).exec(req.headers.cookie || '');
-	if (!m) return false;
+	if (!m) return 0;
 	const [exp, sig] = m[1].split('.');
-	if (!exp || !sig || Number(exp) < Date.now()) return false;
-	return safeEqual(sig, sign(exp));
+	if (!exp || !sig || !(Number(exp) >= Date.now())) return 0;
+	return safeEqual(sig, sign(exp)) ? Number(exp) : 0;
 }
 
 const attempts = new Map(); // ip -> { count, until }
@@ -917,7 +920,8 @@ async function handle(req, res) {
 		}
 		if (p === '/api/index') {
 			const chats = q.listChats.all().map((c) => ({ ...c, tags: JSON.parse(c.tags), models: JSON.parse(c.models) }));
-			return send(res, 200, { chats, folders: q.listFolders.all(), status: syncStatus() });
+			// X-Session-Exp：阅读端的离线缓存只在登录有效期内可读
+			return send(res, 200, { chats, folders: q.listFolders.all(), status: syncStatus() }, { 'X-Session-Exp': String(authed) });
 		}
 		if (p === '/api/search') {
 			const query = (url.searchParams.get('q') || '').trim().slice(0, 200);
@@ -934,7 +938,10 @@ async function handle(req, res) {
 					'Content-Disposition': `attachment; filename="chat-${row.id}.json"`
 				});
 			}
-			return send(res, 200, Buffer.from(body), { 'Content-Type': 'application/json; charset=utf-8' });
+			// 这两个头给阅读端的离线缓存用：存下的那份是不是还新（与对话列表里的同名字段比对）、预存时要不要跳过特别大的对话
+			const buf = Buffer.from(body);
+			const rev = `${row.updated_at}-${row.archived}${row.pinned}${row.missing_upstream}-${encodeURIComponent(row.folder_id ?? '')}`;
+			return send(res, 200, buf, { 'Content-Type': 'application/json; charset=utf-8', 'X-Chat-Rev': rev, 'X-Chat-Size': String(buf.length) });
 		}
 		if ((m = /^\/files\/([0-9a-fA-F-]{36})$/.exec(p))) {
 			const f = q.getFile.get(m[1]);

@@ -57,7 +57,8 @@
 		next: icon('<path d="m9 6 6 6-6 6"/>', 20),
 		panel: icon('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>'),
 		star: icon('<path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8z"/>', 14),
-		filter: icon('<path d="M4 6h16M7 12h10M10 18h4"/>')
+		filter: icon('<path d="M4 6h16M7 12h10M10 18h4"/>'),
+		alert: icon('<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>')
 	};
 	const logo = (size) =>
 		h('span', {
@@ -65,16 +66,169 @@
 			html: `<svg width="${size}" height="${size}" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M9 11h14M9 16h14M9 21h9" stroke-width="2.4" stroke-linecap="round"/></svg>`
 		});
 
-	const api = async (url, opts) => {
-		const res = await fetch(url, { credentials: 'same-origin', ...opts });
+	// 返回 { data, stale }；stale 表示这份回答来自离线缓存
+	const request = async (url, opts) => {
+		let res;
+		try {
+			res = await fetch(url, { credentials: 'same-origin', ...opts });
+		} catch {
+			// 请求没能送到服务器
+			setOffline(true);
+			throw Object.assign(new Error('连接不上服务器'), { net: true });
+		}
+		// Service Worker 在连不上服务器时用缓存作答，并带上这个标记；502 以上是中间的网关在说源站不通
+		const stale = res.headers.get('X-OWA-Cached') === '1';
+		const down = stale || res.status >= 502;
+		setOffline(down);
 		if (res.status === 401 && url !== '/api/login') {
 			showLogin();
-			throw new Error('unauthorized');
+			throw Object.assign(new Error('unauthorized'), { status: 401 });
 		}
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-		return data;
+		let data;
+		try {
+			data = await res.json();
+		} catch {
+			// 回应到了一半连接断了（或者被中间的网关换成了别的东西）
+			if (res.ok) throw Object.assign(new Error('连接中断，内容没有收全'), { net: true });
+			data = {};
+		}
+		if (!res.ok) throw Object.assign(new Error(data.error || (down ? '连接不上服务器' : `HTTP ${res.status}`)), { status: res.status, net: down });
+		return { data, stale };
 	};
+	const api = async (url, opts) => (await request(url, opts)).data;
+
+	// ───────────── 离线可读（见 sw.js） ─────────────
+	const DATA_CACHE = 'owa-data-v1';
+	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+	let offline = false; // 连不上服务器，正在显示缓存里的内容
+	let cached = null; // 离线时：缓存里有哪些对话
+	// 对话的版本：与服务端 /api/chats/<id> 的 X-Chat-Rev 是同一个算法，用来判断缓存里的那份是不是还新
+	const revOf = (c) => `${c.updated_at}-${c.archived}${c.pinned}${c.missing_upstream}-${encodeURIComponent(c.folder_id ?? '')}`;
+	// 缓存里的对话：id -> 存下的那一版。不会顺手把缓存建出来（退出登录后它不该存在）
+	const loadCached = async () => {
+		try {
+			if (!(await caches.has(DATA_CACHE))) return new Map();
+			const out = new Map();
+			for (const r of await (await caches.open(DATA_CACHE)).matchAll()) {
+				const id = r.url && /^\/api\/chats\/([^/]+)$/.exec(new URL(r.url).pathname)?.[1];
+				if (id) out.set(decodeURIComponent(id), r.headers.get('X-Chat-Rev'));
+			}
+			return out;
+		} catch {
+			return null;
+		}
+	};
+	function setOffline(v) {
+		if (offline === v) return;
+		offline = v;
+		document.body.classList.toggle('offline', v);
+		cached = null;
+		if (!$list?.isConnected) return;
+		const paint = () => {
+			if (!$list.isConnected) return;
+			renderStatus();
+			renderSidebar();
+		};
+		paint();
+		if (v) {
+			loadCached().then((map) => ((cached = offline ? map : null), paint()));
+			pollStatus(10000); // 勤问着点，好尽快发现连上了
+		} else {
+			// 重新连上服务器：补传离线期间的阅读位置；对话列表如果还是缓存里的旧版本，重新取一次
+			pushReading();
+			if (state.indexCached && !indexBusy) loadIndex().catch(() => {});
+		}
+	}
+	// 会话结束：存下的内容一并清掉。同时告诉 Service Worker，还在路上的请求回来后也不要再往里放
+	const clearOfflineData = () => {
+		try {
+			navigator.serviceWorker?.controller?.postMessage('logout');
+			caches.delete(DATA_CACHE).catch(() => {});
+		} catch {}
+	};
+	// 退出登录。连不上服务器时会话退不掉（cookie 只有服务器能清）：先记下，下次打开页面时补做
+	let ending = null; // 进行中的退出请求；重新登录要排在它后面，免得新会话被它清掉
+	const endSession = () =>
+		(ending = (async () => {
+			try {
+				if ((await fetch('/api/logout', { method: 'POST', signal: AbortSignal.timeout(4000) })).ok) localStorage.removeItem('logout');
+			} catch {}
+		})());
+	const logout = () => {
+		store.set('logout', 1);
+		showLogin();
+		endSession();
+	};
+	if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+	// 主动下载以备离线：可以在阅读设置里关掉；省流量模式和（能判断出来的）移动网络下也不做
+	const proactive = () => {
+		const conn = navigator.connection;
+		return prefs.precache !== false && !conn?.saveData && conn?.type !== 'cellular';
+	};
+	// 只为让 Service Worker 把回应存下来：正文由它那一份去读，页面这一份不要
+	const quiet = async (u, headers) => {
+		const res = await fetch(u, { credentials: 'same-origin', headers });
+		res.body?.cancel().catch(() => {});
+		return res;
+	};
+	const WARM = 30;
+	let warmRun = 0;
+	// 让离线时手里有东西可看：每次拿到新的对话列表后在后台跑一遍
+	const warmCache = async () => {
+		const sw = navigator.serviceWorker;
+		if (!sw) return;
+		const run = ++warmRun;
+		const live = () => run === warmRun && !offline && $list?.isConnected;
+		if (!sw.controller) await new Promise((r) => sw.addEventListener('controllerchange', r, { once: true }));
+		if (!live()) return;
+		try {
+			// 第一次访问时，头几个请求发生在 Service Worker 接管页面之前，没能存下来，这里补上
+			const have = (await caches.has(DATA_CACHE)) ? new Set((await (await caches.open(DATA_CACHE)).keys()).map((k) => new URL(k.url).pathname)) : new Set();
+			const open = state.current && `/api/chats/${encodeURIComponent(state.current.id)}`;
+			const missed = ['/api/index', '/api/stars', '/api/stats', open].filter((u) => u && !have.has(u));
+			await Promise.all(missed.map((u) => quiet(u)));
+			if (missed.includes(open)) keepImages();
+		} catch {
+			return;
+		}
+		await sleep(3000);
+		if (!live() || !proactive()) return;
+		const have = await loadCached();
+		if (!have) return;
+		// 1. 缓存里已经过时的（同步后对话有变化）；2. 最可能想离线看的：读到一半的、收藏的、置顶的、最近的
+		const stale = state.chats.filter((c) => have.has(c.id) && have.get(c.id) !== revOf(c)).map((c) => c.id);
+		const likely = [...state.chats.filter((c) => unfinished(c.id)).map((c) => c.id), ...[...stars.values()].map((x) => x.chat_id), ...state.chats.filter((c) => c.pinned).map((c) => c.id), ...state.chats.map((c) => c.id)];
+		const wanted = [...new Set(likely)].filter((id) => state.byId.has(id)).slice(0, WARM).filter((id) => !have.has(id));
+		for (const id of [...new Set([...stale, ...wanted])].slice(0, WARM + 10)) {
+			if (!live() || document.hidden) return;
+			try {
+				await quiet(`/api/chats/${encodeURIComponent(id)}`, { 'X-OWA-Warm': '1' });
+			} catch {
+				return;
+			}
+			await sleep(300);
+		}
+	};
+	// 打开的对话里的归档图片是滚到跟前才加载的；在后台先存下来，离线时才不缺图
+	const IMG_KEEP = 12;
+	const IMG_BUDGET = 8 * 1024 * 1024;
+	let imgRun = 0;
+	const keepImages = async () => {
+		const run = ++imgRun;
+		if (!navigator.serviceWorker?.controller || !proactive()) return;
+		await sleep(1500); // 让首屏自己的请求先走
+		const srcs = [...new Set([...($messages?.querySelectorAll('img') || [])].map((im) => im.getAttribute('src') || ''))].filter((u) => /^\/files\/[0-9a-fA-F-]{36}$/.test(u)).slice(0, IMG_KEEP);
+		let budget = IMG_BUDGET;
+		try {
+			for (const src of srcs) {
+				if (run !== imgRun || offline || budget <= 0) return;
+				if (await (await caches.open(DATA_CACHE)).match(src)) continue;
+				budget -= Number((await quiet(src)).headers.get('Content-Length')) || 0;
+			}
+		} catch {}
+	};
+	window.addEventListener('offline', () => $search?.isConnected && setOffline(true));
+	window.addEventListener('online', () => $search?.isConnected && !indexBusy && loadIndex().catch(() => {}));
 
 	const pad = (n) => String(n).padStart(2, '0');
 	const fmtDate = (sec, withTime = true) => {
@@ -132,7 +286,7 @@
 		}
 	};
 	const FONT_STEPS = [0.9, 1, 1.1, 1.2, 1.35];
-	const prefs = { font: 1, wide: false, wrap: false, hideSide: false, ...store.get('reader', {}) };
+	const prefs = { font: 1, wide: false, wrap: false, hideSide: false, precache: true, ...store.get('reader', {}) };
 	if (!(prefs.font >= 0 && prefs.font < FONT_STEPS.length)) prefs.font = 1;
 	const applyPrefs = () => {
 		document.documentElement.style.setProperty('--fs', FONT_STEPS[prefs.font]);
@@ -237,6 +391,16 @@
 			for (const x of (await res.json()).stars) stars.set(starKey(x.chat_id, x.message_id), x);
 		} catch {}
 	};
+	// 让一条消息的收藏按钮与 stars 一致
+	const paintStar = (el) => {
+		if (!el || !state.current) return;
+		const on = stars.has(starKey(state.current.id, el.dataset.id));
+		el.classList.toggle('starred', on);
+		const btn = el.querySelector('.star-btn');
+		btn?.setAttribute('aria-pressed', String(on));
+		btn?.setAttribute('title', on ? '取消收藏' : '收藏这条消息');
+		btn?.setAttribute('aria-label', on ? '取消收藏' : '收藏这条消息');
+	};
 	// 先改界面再发请求，失败了改回去
 	const toggleStar = async (chatId, m) => {
 		const key = starKey(chatId, m.id);
@@ -244,14 +408,7 @@
 		const url = `/api/stars/${encodeURIComponent(chatId)}/${encodeURIComponent(m.id)}`;
 		const paint = () => {
 			renderSidebar();
-			if (state.current?.id !== chatId) return;
-			const el = document.getElementById(`m-${m.id}`);
-			const on = stars.has(key);
-			el?.classList.toggle('starred', on);
-			const btn = el?.querySelector('.star-btn');
-			btn?.setAttribute('aria-pressed', String(on));
-			btn?.setAttribute('title', on ? '取消收藏' : '收藏这条消息');
-			btn?.setAttribute('aria-label', on ? '取消收藏' : '收藏这条消息');
+			if (state.current?.id === chatId) paintStar(document.getElementById(`m-${m.id}`));
 		};
 		const role = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'system';
 		const excerpt = messageText(m).replace(/\s+/g, ' ').trim().slice(0, 200);
@@ -260,10 +417,11 @@
 		paint();
 		try {
 			await api(url, had ? { method: 'DELETE' } : { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ excerpt, role }) });
-		} catch {
+		} catch (e) {
 			if (had) stars.set(key, had);
 			else stars.delete(key);
 			paint();
+			if (e.status !== 401) notify(e.net ? '连不上服务器，收藏没有保存' : `收藏没有保存：${e.message}`);
 		}
 	};
 
@@ -540,7 +698,7 @@
 			e.preventDefault();
 			openLightbox(src, img);
 		});
-		img.addEventListener('error', () => img.replaceWith(h('div', { class: 'chip dim' }, '图片未归档')));
+		img.addEventListener('error', () => img.replaceWith(h('div', { class: 'chip dim' }, offline ? '图片没有缓存' : '图片未归档')));
 		return img;
 	};
 
@@ -700,7 +858,10 @@
 		findQuery: null, // 从搜索结果点进来时，在对话里高亮这个词
 		resume: false, // 从「继续阅读」点进来时，直接回到上次的位置
 		filter: { model: '', days: 0 }, // 列表 / 搜索结果的筛选
-		filterOpen: false
+		filterOpen: false,
+		chars: undefined, // 归档总字数（见 headline）
+		indexCached: false, // 手里的对话列表来自离线缓存
+		titleOnly: false // 搜索结果只匹配了标题（离线）
 	};
 	const filterOn = () => !!(state.filter.model || state.filter.days);
 	const passFilter = (c) => (!state.filter.model || c.models.includes(state.filter.model)) && (!state.filter.days || c.updated_at >= Date.now() / 1000 - state.filter.days * 86400);
@@ -724,11 +885,13 @@
 			e.preventDefault();
 			err.textContent = '';
 			try {
+				await ending;
 				await api('/api/login', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({ password: input.value })
 				});
+				localStorage.removeItem('logout');
 				boot();
 			} catch (e2) {
 				err.textContent = e2.message;
@@ -738,6 +901,15 @@
 		closeLightbox();
 		closePop();
 		hideToast();
+		hideNotice();
+		clearTimeout(statusTimer);
+		warmRun++;
+		imgRun++;
+		statsReq = lastStats = null;
+		state.chars = undefined;
+		clearOfflineData();
+		offline = false;
+		document.body.classList.remove('offline');
 		state.current = null;
 		$find = null;
 		document.body.classList.remove('nav-open', 'home', 'scrolled', 'can-top', 'can-bottom', 'reading');
@@ -783,10 +955,7 @@
 					title: '退出登录',
 					'aria-label': '退出登录',
 					html: I.logout,
-					onclick: async () => {
-						await fetch('/api/logout', { method: 'POST' });
-						showLogin();
-					}
+					onclick: logout
 				}),
 				h('button', { class: 'icon-btn side-hide', title: '收起侧栏', 'aria-label': '收起侧栏', html: I.panel, onclick: () => setSide(false) }),
 				h('button', { class: 'icon-btn side-close', title: '关闭对话列表', 'aria-label': '关闭对话列表', html: I.close, onclick: closeNav })
@@ -820,10 +989,12 @@
 		);
 		const scrim = h('div', { class: 'scrim', onclick: closeNav });
 		$app.replaceChildren(sidebar, scrim, $main);
-		setHome(!/^#\/c\/.+/.test(location.hash));
+		setHome(atHome());
 	}
 
-	// 窄屏下没有打开对话时，对话列表直接铺满屏幕（见 style.css 的 .home）；切换是瞬时的，不走抽屉的滑动动画
+	// 窄屏下没有打开对话时，对话列表直接铺满屏幕（见 style.css 的 .home）；切换是瞬时的，不走抽屉的滑动动画。
+	// 首页的统计在窄屏下另占一页 #/overview，从列表顶上的概览卡片进去（宽屏下两个地址是同一个首页）
+	const atHome = () => !/^#\/(?:c\/.+|overview$)/.test(location.hash);
 	const setHome = (on) => {
 		const cl = document.body.classList;
 		if (cl.contains('home') === on) return;
@@ -897,7 +1068,8 @@
 		const a = h(
 			'a',
 			{
-				class: 'chat-item' + (c.id === state.currentId ? ' active' : '') + (pct != null ? ' recent' : ''),
+				class: 'chat-item' + (c.id === state.currentId ? ' active' : '') + (pct != null ? ' recent' : '') + (offline && cached && !cached.has(c.id) ? ' uncached' : ''),
+				title: offline && cached && !cached.has(c.id) ? '离线，这个对话还没有缓存' : null,
 				href: `#/c/${c.id}`,
 				dataset: { id: c.id },
 				onclick: (e) => {
@@ -1033,7 +1205,7 @@
 		if (state.results) {
 			const all = state.chats.filter((c) => state.results.has(c.id));
 			const hits = all.filter(passFilter);
-			frag.append(h('div', { class: 'group-title' }, `找到 ${hits.length} 个对话` + (hits.length < all.length ? `（另有 ${all.length - hits.length} 个被筛选条件排除）` : '')));
+			frag.append(h('div', { class: 'group-title' }, `找到 ${hits.length} 个对话` + (state.titleOnly ? '（离线，只搜索了标题）' : '') + (hits.length < all.length ? `（另有 ${all.length - hits.length} 个被筛选条件排除）` : '')));
 			for (const c of hits) {
 				const hit = state.results.get(c.id);
 				frag.append(chatItem(c, hit));
@@ -1078,14 +1250,16 @@
 		let chats = state.chats.filter((c) => (state.view === 'missing' ? c.missing_upstream : state.view === 'archived' ? c.archived : !c.archived));
 		if (state.tag) chats = chats.filter((c) => c.tags.includes(state.tag));
 		if (filterOn()) chats = chats.filter(passFilter);
+		const flat = state.view !== 'active' || state.tag || filterOn();
+		// 手机首页：列表顶上放归档的几个数字，点进去是统计页（宽屏的首页本身就是统计，这张卡片不显示）
+		const card = flat || !state.chats.length ? null : homeCard();
+		if (card) frag.append(card);
 		if (!chats.length) {
-			$list.replaceChildren(
-				h('div', { class: 'empty' }, filterOn() ? '没有符合筛选条件的对话' : state.chats.length ? '这里没有对话' : state.status?.configured ? '尚未同步到任何对话' : '尚未配置同步源')
-			);
+			frag.append(h('div', { class: 'empty' }, filterOn() ? '没有符合筛选条件的对话' : state.chats.length ? '这里没有对话' : state.status?.configured ? '尚未同步到任何对话' : '尚未配置同步源'));
+			$list.replaceChildren(frag);
 			return;
 		}
 
-		const flat = state.view !== 'active' || state.tag || filterOn();
 		if (recent.length) {
 			frag.append(h('div', { class: 'group-title' }, '继续阅读'));
 			for (const c of recent) frag.append(chatItem(c, null, reading[c.id].p));
@@ -1172,8 +1346,16 @@
 			const { results } = await api(`/api/search?q=${encodeURIComponent(qv)}`);
 			if (state.query !== qv) return;
 			state.results = new Map(results.map((r) => [r.id, r]));
+			state.titleOnly = false;
 			renderSidebar();
-		} catch {}
+		} catch (e) {
+			if (state.query !== qv || !e.net) return;
+			// 全文索引在服务器上；连不上时退而求其次，只在标题里找
+			const terms = qv.toLowerCase().split(/\s+/);
+			state.results = new Map(state.chats.filter((c) => terms.every((t) => c.title.toLowerCase().includes(t))).map((c) => [c.id, { id: c.id, snippet: null, message_id: null, count: 0, hits: [] }]));
+			state.titleOnly = true;
+			renderSidebar();
+		}
 	}
 
 	// ───────────── 同步状态 ─────────────
@@ -1181,7 +1363,7 @@
 	function renderStatus() {
 		const s = state.status;
 		if (!s) return;
-		const btn = h('button', { class: 'icon-btn' + (s.running ? ' spin' : ''), title: '立即同步', 'aria-label': '立即同步', html: I.sync, disabled: s.running || !s.configured });
+		const btn = h('button', { class: 'icon-btn' + (s.running ? ' spin' : ''), title: '立即同步', 'aria-label': '立即同步', html: I.sync, disabled: s.running || !s.configured || offline });
 		btn.addEventListener('click', async () => {
 			try {
 				state.status = await api('/api/sync', { method: 'POST' });
@@ -1190,10 +1372,11 @@
 			} catch {}
 		});
 		let line;
-		if (!s.configured) line = '未配置同步源';
+		if (offline) line = `${navigator.onLine === false ? '离线' : '连不上服务器'} · 显示已缓存的内容`;
+		else if (!s.configured) line = '未配置同步源';
 		else if (s.running) line = `正在同步${s.phase ? ' · ' + s.phase : ''}`;
 		else line = `${ago(s.last_ok)}同步 · 每 ${s.interval_minutes} 分钟`;
-		const tone = !s.configured ? 'off' : s.running ? 'run' : s.last_error ? 'err' : 'ok';
+		const tone = offline || !s.configured ? 'off' : s.running ? 'run' : s.last_error ? 'err' : 'ok';
 		$status.replaceChildren(
 			h('span', { class: `sync-dot ${tone}`, 'aria-hidden': 'true' }),
 			h(
@@ -1203,7 +1386,7 @@
 				h('div', { class: 'sync-sub' + (s.last_error && !s.running ? ' err' : '') , title: s.last_error || '' },
 					s.last_error && !s.running ? `同步出错：${s.last_error}` : `${s.chats} 个对话 · ${s.messages} 条消息`)
 			),
-			s.chats ? h('a', { class: 'icon-btn export-all', href: '/api/export', download: '', title: '导出全部对话（JSON，可重新导入 Open WebUI）', 'aria-label': '导出全部对话', html: I.download }) : null,
+			s.chats && !offline ? h('a', { class: 'icon-btn export-all', href: '/api/export', download: '', title: '导出全部对话（JSON，可重新导入 Open WebUI）', 'aria-label': '导出全部对话', html: I.download }) : null,
 			btn
 		);
 	}
@@ -1219,7 +1402,7 @@
 				if (prev && (prev.running !== s.running || prev.last_run !== s.last_run) && !s.running) await loadIndex();
 				pollStatus(s.running ? 1500 : 30000);
 			} catch {
-				pollStatus();
+				pollStatus(offline ? 10000 : 30000);
 			}
 		}, delay);
 	}
@@ -1405,7 +1588,8 @@
 						// 只给最高的一根标数值，其余悬停查看
 						// 柱子单独占一个绘图区，高度才是相对同一个基准的百分比
 						h('span', { class: 'bar-plot' }, i === peakAt && x.n ? h('span', { class: 'bar-val' }, x.n) : null, h('i', { class: x.n ? '' : 'zero', style: `height:${x.n ? Math.max(2, (x.n / peak) * 100) : 0}%` })),
-						h('span', { class: 'bar-x' }, i === 0 || x.m === 1 ? `${String(x.y).slice(2)}/${x.m}` : x.m)
+						// 年份只标在第一根和每年 1 月；窄屏上柱子很细，年份另起一行（见 style.css 的 .bar-yy）
+						h('span', { class: 'bar-x' }, i === 0 || x.m === 1 ? h('span', { class: 'bar-yy' }, String(x.y).slice(2), h('span', {}, '/')) : null, h('span', {}, x.m))
 					)
 				)
 			)
@@ -1455,45 +1639,91 @@
 		return cjk + (text.replace(CJK_RE, ' ').match(/[\p{L}\p{N}]+(?:['’._-][\p{L}\p{N}]+)*/gu) || []).length;
 	};
 	const big = (n) => (n < 10000 ? String(Math.round(n)) : n < 1e8 ? `${(n / 1e4).toFixed(n < 1e5 ? 2 : 1)} 万` : `${(n / 1e8).toFixed(2)} 亿`);
-	// 字数与 token 统计：服务端算，首页异步填进来
+	// 首页的三个数字：欢迎页的方块和手机首页列表顶上的概览卡片共用。
+	// 字数（state.chars）要等统计接口：undefined 还没取到，null 取不到或没有内容（不显示）
+	const headline = () => {
+		const s = state.status;
+		if (!s) return [];
+		const out = [
+			[s.chats, '个对话', 'n-chats'],
+			[s.messages, '条消息', 'n-msgs']
+		];
+		if (state.chats.length > 1 && state.chars !== null) out.push([state.chars === undefined ? '…' : big(state.chars), '字', 'n-chars']);
+		return out;
+	};
+	const statTiles = () => h('div', { class: 'stats' }, headline().map(([n, label, cls]) => h('div', { class: 'stat' }, h('div', { class: `stat-num ${cls}` }, n), h('div', { class: 'stat-label' }, label))));
+	const homeCard = () => {
+		const nums = headline();
+		if (!nums.length) return null;
+		return h(
+			'a',
+			{ class: 'home-card', href: '#/overview', 'aria-label': `归档统计：${nums.map(([n, label]) => `${n} ${label}`).join('，')}` },
+			nums.map(([n, label, cls]) => h('span', { class: 'home-stat' }, h('b', { class: cls }, n), label)),
+			h('span', { class: 'home-more', html: I.chevron })
+		);
+	};
+	// 数字变了（同步之后、字数算出来之后）：两处都按现在的状态重画
+	const paintHeadline = () => {
+		document.querySelector('.home-page .stats')?.replaceWith(statTiles());
+		const card = document.querySelector('.home-card');
+		if (card) card.replaceWith(homeCard() || '');
+	};
+	// 字数与 token 统计：服务端算。同一份对话列表只取一次，列表更新后（见 loadIndex）重新取
+	let statsReq = null;
+	let lastStats = null;
+	const loadStats = () =>
+		(statsReq ||= api('/api/stats').then(
+			(st) => {
+				lastStats = st;
+				state.chars = st.user.chars + st.models.reduce((n, m) => n + m.chars, 0) || null;
+				paintHeadline();
+				return st;
+			},
+			(e) => {
+				statsReq = null;
+				if (state.chars === undefined) state.chars = null;
+				paintHeadline();
+				throw e;
+			}
+		));
+	const fillUsage = (box, st) => {
+		if (!st.models.length) return;
+		const chars = st.user.chars + st.models.reduce((n, m) => n + m.chars, 0);
+		const anyEst = st.models.some((m) => m.reported < m.messages);
+		const tok = (m, k) => h('td', { title: m.reported < m.messages ? `${m.messages} 条回答里有 ${m.messages - m.reported} 条上游没有返回用量，按模型估算` : '上游返回的用量' }, (m.reported < m.messages ? '≈ ' : '') + big(m[k]));
+		const sum = (k) => st.models.reduce((n, m) => n + m[k], 0);
+		box.replaceChildren(
+			h('h2', {}, '字数与 token 用量'),
+			h(
+				'div',
+				{ class: 'table-wrap usage-wrap' },
+				h(
+					'table',
+					{},
+					h('thead', {}, h('tr', {}, ['模型', '回答', '字数', '输入 token', '输出 token'].map((t) => h('th', {}, t)))),
+					h(
+						'tbody',
+						{},
+						st.models.map((m) => h('tr', {}, h('th', { title: m.name }, m.name), h('td', {}, m.messages), h('td', {}, big(m.chars)), tok(m, 'input'), tok(m, 'output')))
+					),
+					h(
+						'tfoot',
+						{},
+						h('tr', {}, h('th', {}, '你的提问'), h('td', {}, st.user.messages), h('td', {}, big(st.user.chars)), h('td', {}, '—'), h('td', {}, '—')),
+						h('tr', {}, h('th', {}, '合计'), h('td', {}, sum('messages') + st.user.messages), h('td', {}, big(chars)), h('td', {}, (anyEst ? '≈ ' : '') + big(sum('input'))), h('td', {}, (anyEst ? '≈ ' : '') + big(sum('output'))))
+					)
+				)
+			),
+			h('p', { class: 'viz-note' }, '字数：每个汉字算 1 字，连续的字母或数字算 1 词，不计标点；所有分支都算在内。' + (anyEst ? '带 ≈ 的 token 数含估算：上游没有返回用量的回答，按模型所属的分词器家族由文本折算，输入按当时的全部上文计。' : 'token 数均为上游返回的用量。'))
+		);
+		box.hidden = false;
+	};
 	const statsSection = () => {
 		const box = h('section', { class: 'viz usage', hidden: true });
-		api('/api/stats')
-			.then((st) => {
-				if (!st.models.length) return;
-				const chars = st.user.chars + st.models.reduce((n, m) => n + m.chars, 0);
-				const tile = document.querySelector('.stat-chars .stat-num');
-				if (tile) tile.textContent = big(chars);
-				const anyEst = st.models.some((m) => m.reported < m.messages);
-				const tok = (m, k) => h('td', { title: m.reported < m.messages ? `${m.messages} 条回答里有 ${m.messages - m.reported} 条上游没有返回用量，按模型估算` : '上游返回的用量' }, (m.reported < m.messages ? '≈ ' : '') + big(m[k]));
-				const sum = (k) => st.models.reduce((n, m) => n + m[k], 0);
-				box.replaceChildren(
-					h('h2', {}, '字数与 token 用量'),
-					h(
-						'div',
-						{ class: 'table-wrap usage-wrap' },
-						h(
-							'table',
-							{},
-							h('thead', {}, h('tr', {}, ['模型', '回答', '字数', '输入 token', '输出 token'].map((t) => h('th', {}, t)))),
-							h(
-								'tbody',
-								{},
-								st.models.map((m) => h('tr', {}, h('th', { title: m.name }, m.name), h('td', {}, m.messages), h('td', {}, big(m.chars)), tok(m, 'input'), tok(m, 'output')))
-							),
-							h(
-								'tfoot',
-								{},
-								h('tr', {}, h('th', {}, '你的提问'), h('td', {}, st.user.messages), h('td', {}, big(st.user.chars)), h('td', {}, '—'), h('td', {}, '—')),
-								h('tr', {}, h('th', {}, '合计'), h('td', {}, sum('messages') + st.user.messages), h('td', {}, big(chars)), h('td', {}, (anyEst ? '≈ ' : '') + big(sum('input'))), h('td', {}, (anyEst ? '≈ ' : '') + big(sum('output'))))
-							)
-						)
-					),
-					h('p', { class: 'viz-note' }, '字数：每个汉字算 1 字，连续的字母或数字算 1 词，不计标点；所有分支都算在内。' + (anyEst ? '带 ≈ 的 token 数含估算：上游没有返回用量的回答，按模型所属的分词器家族由文本折算，输入按当时的全部上文计。' : 'token 数均为上游返回的用量。'))
-				);
-				box.hidden = false;
-			})
-			.catch(() => {});
+		// 手头有上一次的结果就先摆上，新的到了再换，页面不会跳一下
+		if (lastStats) fillUsage(box, lastStats);
+		const req = loadStats();
+		req.then((st) => st !== lastStats || fillUsage(box, st)).catch(() => {});
 		return box;
 	};
 	const safeName = (s) => String(s).replace(/[\\/:*?"<>|\n\r]+/g, ' ').trim().slice(0, 80) || 'chat';
@@ -1917,7 +2147,7 @@
 			show();
 		};
 		show();
-		const sw = (label, key, cls = '') => {
+		const sw = (label, key, cls = '', after) => {
 			const b = h(
 				'button',
 				{
@@ -1928,6 +2158,7 @@
 						prefs[key] = !prefs[key];
 						b.setAttribute('aria-checked', String(prefs[key]));
 						keepPos(applyPrefs);
+						after?.();
 					}
 				},
 				h('span', {}, label),
@@ -1941,6 +2172,8 @@
 			h('div', { class: 'set-row' }, h('span', {}, '正文字号'), h('span', { class: 'font-step' }, minus, val, plus)),
 			sw('宽版布局', 'wide', 'only-desktop'),
 			sw('代码自动换行', 'wrap'),
+			// 离线可读需要 Service Worker（HTTPS 或 localhost 才有）
+			navigator.serviceWorker ? sw('预存最近的对话，离线也能看', 'precache', '', () => prefs.precache && (warmCache(), keepImages())) : null,
 			h(
 				'div',
 				{ class: 'set-row' },
@@ -1969,7 +2202,26 @@
 		clearTimeout(toastTimer);
 		$toast?.remove();
 		$toast = null;
-		document.body.classList.remove('has-toast');
+		document.body.classList.toggle('has-toast', !!$notice);
+	};
+	// 一句话的提示（操作没成功之类），几秒后自己消失；续读提示在的话先让位
+	let $notice = null;
+	let noticeTimer = 0;
+	const hideNotice = () => {
+		clearTimeout(noticeTimer);
+		$notice?.remove();
+		$notice = null;
+		if ($toast) $toast.hidden = false;
+		else document.body.classList.remove('has-toast');
+	};
+	const notify = (text) => {
+		hideNotice();
+		if (!$main?.isConnected) return;
+		$notice = h('div', { class: 'toast', role: 'status' }, h('span', { html: I.alert }), h('span', { class: 'toast-text' }, text), h('button', { class: 'icon-btn', title: '关闭', 'aria-label': '关闭', html: I.x, onclick: hideNotice }));
+		if ($toast) $toast.hidden = true;
+		$main.append($notice);
+		document.body.classList.add('has-toast');
+		noticeTimer = setTimeout(hideNotice, 5000);
 	};
 	const resumeTo = (pos) => {
 		hideToast();
@@ -2110,21 +2362,21 @@
 			$find = null;
 			document.title = '对话归档';
 			document.body.classList.remove('scrolled', 'can-top', 'can-bottom', 'reading');
-			setHome(true);
-			const s = state.status;
-			const stat = (n, label, cls = '') => h('div', { class: `stat ${cls}` }, h('div', { class: 'stat-num' }, n), h('div', { class: 'stat-label' }, label));
+			closeNav();
+			setHome(atHome());
 			$main.replaceChildren(
-				topbar(''),
+				topbar('归档统计'),
 				h(
 					'div',
-					{ class: 'welcome' },
+					{ class: 'welcome home-page' },
 					h('div', { class: 'welcome-mark', html: I.archive }),
 					h('h1', {}, '对话归档'),
-					s ? h('div', { class: 'stats' }, stat(s.chats, '个对话'), stat(s.messages, '条消息'), state.chats.length > 1 ? stat('…', '字', 'stat-chars') : null) : null,
-					h('p', { class: 'dim' }, '从左侧选择一个对话开始阅读，或直接搜索全文。'),
+					statTiles(),
+					h('p', { class: 'dim only-desktop' }, '从左侧选择一个对话开始阅读，或直接搜索全文。'),
 					overview()
 				)
 			);
+			window.scrollTo(0, 0);
 			return;
 		}
 		let data;
@@ -2238,6 +2490,7 @@
 		}
 		state.resume = false;
 		updateProgress(false);
+		keepImages();
 	}
 
 	const topbar = (title, tools = false) => {
@@ -2266,8 +2519,18 @@
 	};
 
 	// ───────────── 启动与路由 ─────────────
-	async function loadIndex() {
-		const data = await api('/api/index');
+	let indexBusy = false;
+	// patient：后台刷新时宁可多等一会儿网络，也不要拿缓存里的旧列表顶替（见 sw.js 的 answer）
+	async function loadIndex(patient = true) {
+		let got;
+		indexBusy = true;
+		try {
+			got = await request('/api/index', patient ? { headers: { 'X-OWA-Patient': '1' } } : undefined);
+		} finally {
+			indexBusy = false;
+		}
+		const { data } = got;
+		state.indexCached = got.stale;
 		state.chats = data.chats;
 		state.byId = new Map(data.chats.map((c) => [c.id, c]));
 		state.folders = data.folders;
@@ -2282,6 +2545,18 @@
 			await openChat(state.currentId, { quiet: true });
 			window.scrollTo(0, y);
 		}
+		// 统计跟着对话列表走；首页开着的话原地更新
+		statsReq = null;
+		const home = $main.querySelector('.home-page');
+		if (home) {
+			paintHeadline();
+			const old = home.querySelector('.overview');
+			const fresh = overview();
+			if (old && fresh) old.replaceWith(fresh);
+			else if (fresh) home.append(fresh);
+			else old?.remove();
+		}
+		if (!got.stale) warmCache();
 	}
 	const goAdj = (dir) => {
 		const c = state.current?.adj?.[dir];
@@ -2307,17 +2582,36 @@
 		else if (m?.[2]) jumpToHit();
 	};
 	async function boot() {
-		renderShell();
-		try {
-			// 阅读位置和对话列表一起取；取不到也不影响阅读
-			await Promise.all([loadIndex(), pullReading(), loadStars()]);
-		} catch {
+		// 上次是在连不上服务器的时候退出的：把会话真正结束掉
+		if (store.get('logout')) {
+			showLogin();
+			endSession();
 			return;
 		}
+		renderShell();
+		// 阅读位置、收藏和对话列表一起取；前两样取不到也不影响阅读，网络很慢时不干等
+		let shown = false;
+		const extras = Promise.all([pullReading(), loadStars()]).then(() => {
+			// 来晚了：界面已经先用本机的记录画出来了，这里补上
+			if (!shown || !$list.isConnected) return;
+			renderSidebar();
+			for (const el of msgEls()) paintStar(el);
+		});
+		try {
+			await Promise.all([loadIndex(false), Promise.race([extras, sleep(3000)])]);
+		} catch (e) {
+			// 未登录时这里已经换成了登录页；其余情况（连不上服务器，也没有缓存）说明原因，网络恢复后自动重来
+			if (!$list.isConnected) return;
+			const box = h('div', { class: 'welcome' }, h('h1', {}, '无法加载'), h('p', {}, e.message), h('p', {}, h('button', { class: 'btn', onclick: () => location.reload() }, '重试')));
+			$app.replaceChildren(box);
+			window.addEventListener('online', () => box.isConnected && location.reload(), { once: true });
+			return;
+		}
+		shown = true;
 		renderSidebar();
 		state.currentId = undefined;
 		route();
-		pollStatus(state.status?.running ? 1500 : 30000);
+		pollStatus(state.status?.running ? 1500 : offline ? 10000 : 30000);
 	}
 	window.addEventListener('hashchange', route);
 	document.addEventListener('keydown', (e) => {

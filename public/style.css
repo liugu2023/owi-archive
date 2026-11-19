@@ -1126,6 +1126,11 @@ mark.hit.cur {
 	flex: none;
 	opacity: 0.7;
 }
+.toast-text {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
 .toast-btn {
 	min-height: 32px;
 	padding: 0 14px;
@@ -1319,6 +1324,8 @@ body.lb-open {
 /* ── 首页概览 ── */
 .overview {
 	display: grid;
+	/* 不让内容（比如不换行的表格）把这一列撑得比屏幕还宽 */
+	grid-template-columns: minmax(0, 1fr);
 	gap: 16px;
 	margin-top: 32px;
 	text-align: left;
@@ -1485,8 +1492,51 @@ body.lb-open {
 	border-bottom: 0;
 	font-weight: 600;
 }
-.welcome {
-	max-width: 600px;
+/* ── 手机首页列表顶上的概览卡片（宽屏的首页本身就是统计，用不着；显示规则见窄屏部分的 .home） ── */
+.home-card {
+	display: none;
+	align-items: center;
+	gap: 8px;
+	margin: 8px 2px 0;
+	padding: 10px 6px 10px 14px;
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	background: var(--surface);
+	color: var(--muted);
+	font-size: 12px;
+	line-height: 1.4;
+	text-decoration: none;
+	transition: background-color 0.15s;
+}
+.home-card:active {
+	background: var(--active);
+}
+.home-stat {
+	display: flex;
+	flex: 1 1 0;
+	flex-direction: column;
+	min-width: 0;
+}
+.home-stat b {
+	overflow: hidden;
+	color: var(--text);
+	font-size: 17px;
+	font-weight: 650;
+	font-variant-numeric: tabular-nums;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.home-more {
+	display: grid;
+	flex: none;
+	color: var(--faint);
+}
+
+/* ── 离线 ── */
+.chat-item.uncached .chat-title-text {
+	color: var(--faint);
+	text-decoration: line-through;
+	text-decoration-color: var(--line-strong);
 }
 
 /* ── 收藏 ── */
@@ -1547,6 +1597,10 @@ body.lb-open {
 	margin: 0 auto;
 	padding: 12vh 28px 48px;
 	text-align: center;
+}
+/* 首页带统计图表，比纯提示页宽一些：字数 / token 表格才放得下 */
+.home-page {
+	max-width: 600px;
 }
 .welcome-mark {
 	display: grid;
@@ -2050,6 +2104,9 @@ pre.plain {
 
 /* ── 触屏 / 窄屏：放大可点击区域 ── */
 @media (pointer: coarse), (max-width: 860px) {
+	.hbar {
+		min-height: 44px;
+	}
 	:root {
 		--row-h: 46px;
 		--ctl-h: 44px;
@@ -2271,6 +2328,9 @@ pre.plain {
 	.home .side-head {
 		padding-top: 10px;
 	}
+	.home .home-card {
+		display: flex;
+	}
 	.no-anim .sidebar,
 	.no-anim .scrim {
 		transition: none;
@@ -2348,6 +2408,42 @@ pre.plain {
 	.welcome {
 		padding: 14vh max(20px, var(--safe-r)) 48px max(20px, var(--safe-l));
 	}
+	/* 统计页（#/overview）：内容本身就是主角，不必像提示页那样留出大片空白 */
+	.home-page {
+		padding-top: 28px;
+		padding-bottom: calc(48px + var(--safe-b));
+	}
+	.home-page .welcome-mark {
+		display: none;
+	}
+	.home-page .stats {
+		gap: 8px;
+		margin-top: 16px;
+	}
+	.home-page .stat {
+		flex: 1 1 0;
+		min-width: 0;
+		padding: 12px 8px;
+	}
+	.home-page .stat-num {
+		overflow: hidden;
+		font-size: 20px;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.home-page .overview {
+		margin-top: 20px;
+	}
+	.viz {
+		padding: 14px 14px 12px;
+	}
+	.usage th,
+	.usage td {
+		padding: 6px 8px;
+	}
+	.usage th:first-child {
+		max-width: 108px;
+	}
 	.chat-head {
 		padding-bottom: 20px;
 	}
@@ -2408,6 +2504,23 @@ pre.plain {
 /* ── 手机：导出按钮等分一行 ── */
 @media (max-width: 520px) {
 	.find-field > span:first-child {
+		display: none;
+	}
+	/* 柱子很细，「25/12」这样的标签会挤到隔壁：月份一行，年份另起一行 */
+	.bar-x {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		height: 38px;
+		line-height: 16px;
+		padding-top: 2px;
+	}
+	.bar-yy {
+		order: 1;
+		color: var(--faint);
+		font-size: 11px;
+	}
+	.bar-yy span {
 		display: none;
 	}
 	.actions .btn {

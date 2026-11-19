@@ -182,7 +182,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 		assert.match(r.headers.get('set-cookie'), /HttpOnly/);
 
 		// ── 静态资源 ──
-		for (const p of ['/', '/app.js', '/style.css', '/vendor/marked.js', '/vendor/purify.js', '/vendor/highlight.js', '/vendor/katex/katex.min.js', '/vendor/katex/katex.min.css', '/vendor/hljs-dark.css']) {
+		for (const p of ['/', '/app.js', '/sw.js', '/style.css', '/vendor/marked.js', '/vendor/purify.js', '/vendor/highlight.js', '/vendor/katex/katex.min.js', '/vendor/katex/katex.min.css', '/vendor/hljs-dark.css']) {
 			assert.equal((await fetch(base + p)).status, 200, p);
 		}
 		const css = await (await fetch(base + '/vendor/katex/katex.min.css')).text();
