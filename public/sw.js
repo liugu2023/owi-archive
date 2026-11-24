@@ -129,7 +129,19 @@ function data(e, url) {
 	const born = epoch;
 	const warm = req.headers.has('X-OWA-Warm'); // 后台预存（见 app.js 的 warmCache）
 	let saving = null;
-	const net = fetch(req).then(async (res) => {
+	// 对话正文：手里存着一份的话把它的版本报给服务器，没变就只回一个 304，不必把几 MB 的正文再传一遍
+	const conditional = async () => {
+		if (!/^\/api\/chats\/[^/]+$/.test(url.pathname) || !(await caches.has(DATA))) return fetch(req);
+		const have = await (await caches.open(DATA)).match(url.href);
+		const rev = have?.headers.get('X-Chat-Rev');
+		if (!rev) return fetch(req);
+		const headers = new Headers(req.headers);
+		headers.set('If-None-Match', `"${rev}"`);
+		const res = await fetch(new Request(req, { headers }));
+		// 服务器确认过了，这一份就是最新的（不带「来自缓存」的标记）
+		return res.status === 304 && born === epoch ? new Response(have.body, { status: 200, headers: have.headers }) : res;
+	};
+	const net = conditional().then(async (res) => {
 		if (res.status === 401) {
 			epoch++;
 			await caches.delete(DATA);
@@ -137,7 +149,7 @@ function data(e, url) {
 			const ok = storable(url, res);
 			// 接口返回的不是 JSON：多半是被中间的什么东西（比如要登录的 Wi-Fi）换掉了，当作没连上
 			if (!ok && url.pathname.startsWith('/api/')) throw new Error('unexpected response');
-			if (ok && !(warm && Number(res.headers.get('X-Chat-Size')) > WARM_MAX)) saving = remember(url, res.clone(), born).catch(() => {});
+			if (ok && res.url && !(warm && Number(res.headers.get('X-Chat-Size')) > WARM_MAX)) saving = remember(url, res.clone(), born).catch(() => {});
 		}
 		return res;
 	});

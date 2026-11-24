@@ -2176,7 +2176,19 @@
 		for (let d = el.closest('details:not([open])'); d; d = d.parentElement?.closest('details:not([open])')) el = d;
 		return el.getBoundingClientRect().top + window.scrollY;
 	};
-	const nearestHit = (fromY) => Math.max(0, find.hits.findIndex((hit) => hitY(hit) >= fromY + topOffset() - 1));
+	// 从 fromY 往下的第一处命中（没有就回到第一处）。命中按文档顺序排列，位置只增不减，所以二分着找：
+	// 量一处屏幕外的命中，就得把它所在的消息排一次版，逐个量过去在长对话里要一两秒
+	const nearestHit = (fromY) => {
+		const line = fromY + topOffset() - 1;
+		let lo = 0;
+		let hi = find.hits.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (hitY(find.hits[mid]) >= line) hi = mid;
+			else lo = mid + 1;
+		}
+		return lo < find.hits.length ? lo : 0;
+	};
 	const runFind = () => {
 		clearMarks();
 		const q = find.q.toLowerCase();

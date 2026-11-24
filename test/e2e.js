@@ -383,6 +383,26 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 		assert.equal((await (await get('/api/stats')).json()).user.chars, userChars, '重复请求结果一致（走缓存）');
 		assert.ok(userChars >= 10 && stats.user.messages >= idx.chats.length);
 
+		// 统计存在数据库里，重启服务不必重算
+		assert.equal(new (require('node:sqlite').DatabaseSync)(path.join(TMP, 'archive.db'), { readOnly: true }).prepare('SELECT COUNT(*) AS n FROM chat_stats').get().n, idx.chats.length, '每个对话的统计在同步时就存下了');
+
+		// ── 对话正文：版本没变时回 304 ──
+		r = await get('/api/chats/stats-0');
+		const rev = r.headers.get('x-chat-rev');
+		await r.text();
+		r = await get('/api/chats/stats-0', { headers: { 'If-None-Match': `"${rev}"` } });
+		assert.equal(r.status, 304);
+		assert.equal((await r.text()).length, 0);
+		assert.equal((await get('/api/chats/stats-0', { headers: { 'If-None-Match': '"旧的"'.replace('旧的', 'old') } })).status, 200, '版本对不上就照常返回');
+		assert.equal((await get('/api/chats/stats-0?download', { headers: { 'If-None-Match': `"${rev}"` } })).status, 200, '下载不走 304');
+		assert.equal((await get('/api/chats/no-such', { headers: { 'If-None-Match': `"${rev}"` } })).status, 404);
+
+		// ── 登录限速：认反向代理写的地址（X-Forwarded-For 最右一段），伪造的头绕不过去 ──
+		const bad = (headers) => fetch(base + '/api/login', { method: 'POST', headers, body: JSON.stringify({ password: 'x' }) }).then((x) => x.status);
+		for (let i = 0; i < 5; i++) assert.equal(await bad({ 'X-Forwarded-For': `10.0.0.${i}, 203.0.113.7`, 'CF-Connecting-IP': `10.1.1.${i}` }), 401);
+		assert.equal(await bad({ 'X-Forwarded-For': '10.9.9.9, 203.0.113.7', 'CF-Connecting-IP': '10.2.2.2' }), 429, '换着花样伪造左边的地址和 CF 头也照样被限');
+		assert.equal(await bad({ 'X-Forwarded-For': '203.0.113.8' }), 401, '别的访问者不受牵连');
+
 		// ── 导出整个归档 ──
 		assert.equal((await fetch(base + '/api/export')).status, 401);
 		r = await get('/api/export');

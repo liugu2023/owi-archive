@@ -19,7 +19,8 @@ const CFG = {
 	intervalMin: Math.max(1, Number(env.SYNC_INTERVAL_MINUTES || 15)),
 	downloadFiles: env.SYNC_FILES !== '0',
 	maxFileBytes: Number(env.MAX_FILE_MB || 50) * 1024 * 1024,
-	requestTimeoutMs: Number(env.REQUEST_TIMEOUT_SECONDS || 60) * 1000
+	requestTimeoutMs: Number(env.REQUEST_TIMEOUT_SECONDS || 60) * 1000,
+	trustProxy: env.TRUST_PROXY === '1'
 };
 
 if (!CFG.password) {
@@ -82,6 +83,13 @@ CREATE TABLE IF NOT EXISTS reading (
 	pct INTEGER NOT NULL DEFAULT 0,
 	t INTEGER NOT NULL
 );
+-- 每个对话的字数 / token 统计：同步时算好存下，统计接口只做汇总。ver 是算法的版本（见 STATS_VER）
+CREATE TABLE IF NOT EXISTS chat_stats (
+	chat_id TEXT PRIMARY KEY,
+	updated_at INTEGER NOT NULL,
+	ver TEXT NOT NULL,
+	stats TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(
 	chat_id UNINDEXED, message_id UNINDEXED, role UNINDEXED, text, tokenize='trigram'
 );
@@ -118,7 +126,10 @@ const q = {
 		ON CONFLICT(chat_id, message_id) DO UPDATE SET role=excluded.role, excerpt=excluded.excerpt`),
 	delStar: db.prepare('DELETE FROM stars WHERE chat_id = ? AND message_id = ?'),
 	countStars: db.prepare('SELECT COUNT(*) AS n FROM stars'),
-	statsIndex: db.prepare('SELECT id, updated_at FROM chats'),
+	statsIndex: db.prepare('SELECT c.id, c.updated_at, s.stats FROM chats c LEFT JOIN chat_stats s ON s.chat_id = c.id AND s.updated_at = c.updated_at AND s.ver = ?'),
+	putStats: db.prepare(`INSERT INTO chat_stats(chat_id, updated_at, ver, stats) VALUES(?, ?, ?, ?)
+		ON CONFLICT(chat_id) DO UPDATE SET updated_at=excluded.updated_at, ver=excluded.ver, stats=excluded.stats`),
+	chatRev: db.prepare('SELECT updated_at, archived, pinned, folder_id, missing_upstream FROM chats WHERE id = ?'),
 	statsData: db.prepare('SELECT data FROM chats WHERE id = ?'),
 	allChatData: db.prepare('SELECT data FROM chats ORDER BY updated_at DESC'),
 	getReading: db.prepare('SELECT message_id, rel, pct, t FROM reading WHERE chat_id = ?'),
@@ -268,32 +279,38 @@ function chatStats(body) {
 	}
 	return out;
 }
-const statsCache = new Map(); // chat id -> { updated_at, stats }
+// 算法或者上面那张系数表一改，存下的结果就作废重算
+const STATS_VER = crypto.createHash('sha1').update(String(chatStats) + String(measure) + String(usageOf) + JSON.stringify(TOKEN_FAMILIES.map(([re, ...k]) => [String(re), ...k])) + TOKEN_DEFAULT).digest('hex').slice(0, 12);
+const EMPTY_STATS = () => ({ user: { chars: 0, messages: 0 }, models: {} });
+function statsFor(body) {
+	try {
+		return chatStats(body);
+	} catch {
+		return EMPTY_STATS();
+	}
+}
 function archiveStats() {
-	const seen = new Set();
-	const total = { user: { chars: 0, messages: 0 }, models: {} };
-	// 只有新的、改过的对话才去读正文，其余用上次算好的
-	for (const row of q.statsIndex.all()) {
-		seen.add(row.id);
-		let c = statsCache.get(row.id);
-		if (!c || c.updated_at !== row.updated_at) {
-			let st;
+	const total = EMPTY_STATS();
+	for (const row of q.statsIndex.all(STATS_VER)) {
+		let st;
+		if (row.stats) st = JSON.parse(row.stats);
+		else {
+			// 还没算过的（加上这张表之前同步的对话、算法变了之后）：现在补上，只需要这一次
 			try {
-				st = chatStats(JSON.parse(q.statsData.get(row.id).data).chat);
+				st = statsFor(JSON.parse(q.statsData.get(row.id).data).chat);
 			} catch {
-				st = { user: { chars: 0, messages: 0 }, models: {} };
+				st = EMPTY_STATS();
 			}
-			statsCache.set(row.id, (c = { updated_at: row.updated_at, stats: st }));
+			q.putStats.run(row.id, row.updated_at, STATS_VER, JSON.stringify(st));
 		}
-		total.user.chars += c.stats.user.chars;
-		total.user.messages += c.stats.user.messages;
-		for (const [name, a] of Object.entries(c.stats.models)) {
+		total.user.chars += st.user.chars;
+		total.user.messages += st.user.messages;
+		for (const [name, a] of Object.entries(st.models)) {
 			const t = (total.models[name] ||= { chats: 0, chars: 0, messages: 0, input: 0, output: 0, reported: 0 });
 			t.chats++;
 			for (const k of ['chars', 'messages', 'input', 'output', 'reported']) t[k] += a[k];
 		}
 	}
-	for (const id of statsCache.keys()) if (!seen.has(id)) statsCache.delete(id);
 	const models = Object.entries(total.models)
 		.map(([name, a]) => ({ name, ...a, input: Math.round(a.input), output: Math.round(a.output) }))
 		.sort((a, b) => b.output + b.input - (a.output + a.input));
@@ -352,6 +369,7 @@ function storeChat(remote, flags) {
 			JSON.stringify(record),
 			Math.floor(Date.now() / 1000)
 		);
+		q.putStats.run(remote.id, Number(remote.updated_at) || 0, STATS_VER, JSON.stringify(statsFor(body)));
 		q.delFts.run(remote.id);
 		for (const m of messages) {
 			const text = searchableText(m);
@@ -621,10 +639,22 @@ function isAuthed(req) {
 	return safeEqual(sig, sign(exp)) ? Number(exp) : 0;
 }
 
-const attempts = new Map(); // ip -> { count, until }
+const attempts = new Map(); // ip -> { count, until, at }
+// 登录限速按这个地址算。请求头是可以随便写的，所以只有连接来自本机上的反向代理（Caddy / Nginx / cloudflared）时
+// 才看 X-Forwarded-For，并且只取最右边那一段 —— 那是代理自己写上去的，左边的可能是访问者伪造的。
+// 反向代理在别的机器上时设 TRUST_PROXY=1
+const LOOPBACK = /^(?:127\.|::1$|::ffff:127\.)/;
 function clientIp(req) {
-	return req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '';
+	const peer = req.socket.remoteAddress || '';
+	if (!CFG.trustProxy && !LOOPBACK.test(peer)) return peer;
+	const fwd = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim();
+	return fwd || peer;
 }
+// 失败记录过了锁定期（没被锁的过一小时）就清掉
+setInterval(() => {
+	const now = Date.now();
+	for (const [ip, a] of attempts) if (Math.max(a.until, a.at + 3600000) < now) attempts.delete(ip);
+}, 600000).unref();
 
 // ───────────────────────── HTTP ─────────────────────────
 const MIME = {
@@ -841,7 +871,7 @@ async function handle(req, res) {
 		}
 		if (typeof password !== 'string' || !safeEqual(password, CFG.password)) {
 			const count = (a?.count || 0) + 1;
-			attempts.set(ip, { count, until: count >= 5 ? Date.now() + Math.min(2 ** (count - 5), 60) * 60000 : 0 });
+			attempts.set(ip, { count, at: Date.now(), until: count >= 5 ? Date.now() + Math.min(2 ** (count - 5), 60) * 60000 : 0 });
 			return send(res, 401, { error: '密码错误' });
 		}
 		attempts.delete(ip);
@@ -959,6 +989,14 @@ async function handle(req, res) {
 		}
 		let m;
 		if ((m = /^\/api\/chats\/([^/]+)$/.exec(p))) {
+			// 阅读端手里有同一版时（见 sw.js 的 conditional）不必再传一遍正文
+			const revOf = (r) => `${r.updated_at}-${r.archived}${r.pinned}${r.missing_upstream}-${encodeURIComponent(r.folder_id ?? '')}`;
+			const light = q.chatRev.get(m[1]);
+			if (!light) return send(res, 404, { error: '对话不存在' });
+			if (!url.searchParams.has('download') && req.headers['if-none-match'] === `"${revOf(light)}"`) {
+				res.writeHead(304, { ...SECURITY_HEADERS, 'Cache-Control': 'no-store' });
+				return res.end();
+			}
 			const row = q.getChat.get(m[1]);
 			if (!row) return send(res, 404, { error: '对话不存在' });
 			const body = `{"archived":${row.archived},"pinned":${row.pinned},"folder_id":${JSON.stringify(row.folder_id)},"tags":${row.tags},"synced_at":${row.synced_at},"missing_upstream":${row.missing_upstream},"record":${row.data}}`;
@@ -970,7 +1008,7 @@ async function handle(req, res) {
 			}
 			// 这两个头给阅读端的离线缓存用：存下的那份是不是还新（与对话列表里的同名字段比对）、预存时要不要跳过特别大的对话
 			const buf = Buffer.from(body);
-			const rev = `${row.updated_at}-${row.archived}${row.pinned}${row.missing_upstream}-${encodeURIComponent(row.folder_id ?? '')}`;
+			const rev = revOf(row);
 			return send(res, 200, buf, { 'Content-Type': 'application/json; charset=utf-8', 'X-Chat-Rev': rev, 'X-Chat-Size': String(buf.length) });
 		}
 		if ((m = /^\/files\/([0-9a-fA-F-]{36})$/.exec(p))) {
