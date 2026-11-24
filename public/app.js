@@ -2149,8 +2149,10 @@
 	const showCount = () => {
 		if (!$find) return;
 		const n = find.hits.length;
-		$find.count.textContent = !find.q ? '' : !n ? '无结果' : `${find.idx + 1} / ${n >= FIND_MAX ? FIND_MAX + '+' : n}`;
-		$find.bar.classList.toggle('none', !!find.q && !n);
+		// 长对话还在后台加载：后面的部分还没查到，数目不是最终的（加载完会自动补查，见 finishRender）
+		const more = pending();
+		$find.count.textContent = !find.q ? '' : !n ? (more ? '加载中…' : '无结果') : `${find.idx + 1} / ${n >= FIND_MAX ? FIND_MAX + '+' : more ? n + '…' : n}`;
+		$find.bar.classList.toggle('none', !!find.q && !n && !more);
 		$find.prev.disabled = $find.next.disabled = n < 2;
 	};
 	const gotoHit = (i, scroll = true) => {

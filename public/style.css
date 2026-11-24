@@ -1884,6 +1884,8 @@ body.lb-open {
 .attachments {
 	display: flex;
 	flex-wrap: wrap;
+	/* 文件标签不跟着旁边的图片拉高 */
+	align-items: flex-end;
 	gap: 8px;
 	margin: 4px 0 8px;
 }
@@ -2607,6 +2609,10 @@ pre.plain {
 	* {
 		animation: none !important;
 		transition: none !important;
+	}
+	/* 加载标识不能完全静止，否则像是卡死了：不转圈，改成缓慢地明暗变化 */
+	.spinner {
+		animation: pulse 1.6s ease-in-out infinite !important;
 	}
 }
 
