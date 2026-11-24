@@ -231,6 +231,18 @@ a {
 		transform: rotate(360deg);
 	}
 }
+/* 转圈的加载标识：颜色跟着所在位置的文字走 */
+.spinner {
+	display: inline-block;
+	flex: none;
+	box-sizing: border-box;
+	width: 16px;
+	height: 16px;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.8s linear infinite;
+}
 .btn {
 	display: inline-flex;
 	align-items: center;
@@ -793,11 +805,22 @@ details[open] > summary .fold-caret {
 	overflow: hidden;
 }
 .progress i {
+	position: relative;
 	display: block;
 	height: 100%;
 	background: var(--accent);
 	transform: scaleX(0);
 	transform-origin: left;
+}
+/* 长对话分批渲染时：已经画出来的部分（像视频的缓冲条） */
+.progress b {
+	position: absolute;
+	inset: 0;
+	background: var(--accent);
+	opacity: 0.28;
+	transform: scaleX(0);
+	transform-origin: left;
+	transition: transform 0.2s linear;
 }
 .scrim {
 	display: none;
@@ -1141,6 +1164,10 @@ mark.hit.cur {
 	font-size: 13px;
 	font-weight: 600;
 	cursor: pointer;
+}
+.toast.busy {
+	gap: 10px;
+	padding: 11px 18px 11px 14px;
 }
 .toast .icon-btn,
 .toast .icon-btn:hover:not(:disabled) {
@@ -1705,6 +1732,39 @@ body.lb-open {
 	gap: 8px;
 	margin-top: 18px;
 }
+/* 对话还没取回来 */
+.loading-page {
+	padding: 24vh 28px 48px;
+	color: var(--muted);
+	font-size: 14px;
+	text-align: center;
+}
+.loading-page .spinner {
+	width: 28px;
+	height: 28px;
+	border-width: 3px;
+	color: var(--accent);
+}
+.loading-page p {
+	margin: 14px 0 0;
+}
+/* 消息列表下面：其余的消息还在后台渲染 */
+.loading-more {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	margin-top: 32px;
+	padding: 14px 0;
+	color: var(--muted);
+	font-size: 13px;
+}
+.loading-more .spinner {
+	color: var(--accent);
+}
+.loading-count {
+	font-variant-numeric: tabular-nums;
+}
 .reader-foot {
 	margin-top: 56px;
 	padding-top: 18px;
@@ -1716,9 +1776,25 @@ body.lb-open {
 
 /* ── 消息 ── */
 .msg {
-	margin-top: 32px;
+	/* 四周留 8px 内边距（用负外边距抵回去）：焦点框和跳转时的高亮画在消息框里面，见下面的 .lazy */
+	margin: 24px -8px -8px;
+	padding: 8px;
 	scroll-margin-top: 64px;
 	border-radius: var(--radius-sm);
+}
+/* 长对话（分批渲染的，见 app.js 的 renderMessages）：屏幕外的消息不排版、不绘制，每一帧的开销只跟眼前的几条有关。
+   消息框外面的东西会被裁掉；每条消息占多高由 app.js 量好后写在它身上 */
+.messages.lazy .msg {
+	content-visibility: auto;
+	contain-intrinsic-size: auto 480px;
+}
+/* 量高度用的盒子：和消息列表一样宽（宽度由 app.js 设），看不见，不参与页面的排版；消息在里面照常排版 */
+.msg-measure {
+	position: fixed;
+	top: 0;
+	left: 0;
+	visibility: hidden;
+	pointer-events: none;
 }
 .msg.flash {
 	animation: flash 1.6s ease-out;
@@ -1726,11 +1802,9 @@ body.lb-open {
 @keyframes flash {
 	from {
 		background: var(--mark);
-		box-shadow: 0 0 0 8px var(--mark);
 	}
 	to {
 		background: transparent;
-		box-shadow: 0 0 0 8px transparent;
 	}
 }
 .msg-head {
@@ -2457,7 +2531,7 @@ pre.plain {
 		white-space: nowrap;
 	}
 	.msg {
-		margin-top: 26px;
+		margin-top: 18px;
 		scroll-margin-top: calc(64px + var(--safe-t));
 	}
 	.bubble {
@@ -2543,6 +2617,7 @@ pre.plain {
 	.scrim,
 	.fab,
 	.toast,
+	.loading-more,
 	.lightbox,
 	.chat-nav,
 	.code-more,
@@ -2575,7 +2650,9 @@ pre.plain {
 	.code-block.long:not(.open) pre::after {
 		content: none;
 	}
-	.msg {
+	.msg,
+	.messages.lazy .msg {
+		content-visibility: visible;
 		break-inside: auto;
 	}
 }

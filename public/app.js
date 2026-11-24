@@ -20,6 +20,11 @@
 		}
 		return el;
 	};
+	// 换掉一个元素的全部子节点。原生的 replaceChildren 会把 null 当成文字「null」插进去，这里和 h() 一样跳过空值
+	const fill = (el, ...children) => {
+		el.replaceChildren(...children.flat(Infinity).filter((c) => c != null && c !== false));
+		return el;
+	};
 	const icon = (d, size = 16) =>
 		`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
 	const I = {
@@ -910,6 +915,7 @@
 		clearOfflineData();
 		offline = false;
 		document.body.classList.remove('offline');
+		dropRender();
 		state.current = null;
 		$find = null;
 		document.body.classList.remove('nav-open', 'home', 'scrolled', 'can-top', 'can-bottom', 'reading');
@@ -1129,7 +1135,8 @@
 			});
 			return el;
 		};
-		$filters.replaceChildren(
+		fill(
+			$filters,
 			select('按模型筛选', state.filter.model, [['', '全部模型'], ...[...freq].sort((a, b) => b[1] - a[1]).map(([m, n]) => [m, `${m}（${n}）`])], (v) => (state.filter.model = v)),
 			select('按时间筛选', state.filter.days, [[0, '全部时间'], [7, '近 7 天'], [30, '近 30 天'], [90, '近 3 个月'], [365, '近一年']], (v) => (state.filter.days = Number(v))),
 			filterOn()
@@ -1377,7 +1384,8 @@
 		else if (s.running) line = `正在同步${s.phase ? ' · ' + s.phase : ''}`;
 		else line = `${ago(s.last_ok)}同步 · 每 ${s.interval_minutes} 分钟`;
 		const tone = offline || !s.configured ? 'off' : s.running ? 'run' : s.last_error ? 'err' : 'ok';
-		$status.replaceChildren(
+		fill(
+			$status,
 			h('span', { class: `sync-dot ${tone}`, 'aria-hidden': 'true' }),
 			h(
 				'div',
@@ -1457,9 +1465,14 @@
 			const next = entry.siblings[entry.index + delta];
 			if (next == null) return;
 			tree.choice.set(entry.parent, next);
+			// 换上来的那个版本摆在原来那条消息在屏幕上的位置
 			const y = window.scrollY;
-			renderMessages();
-			window.scrollTo(0, y);
+			const top = document.getElementById(`m-${entry.msg.id}`)?.getBoundingClientRect().top ?? 0;
+			renderMessages({ reach: y });
+			whenShown(next, () => {
+				const el = document.getElementById(`m-${next}`);
+				settle(() => (el.isConnected ? el.getBoundingClientRect().top + window.scrollY - top : window.scrollY));
+			});
 		};
 		return h(
 			'span',
@@ -1527,25 +1540,219 @@
 	};
 
 	let $messages;
-	function renderMessages() {
-		const path = state.current.tree.path();
-		const nodes = [];
-		let lastDay = null;
-		for (const entry of path) {
+	let $loader; // 消息列表下面的「正在加载其余消息」
+	let $measure; // 量消息高度用的盒子（见 pump）
+
+	// ── 分批渲染 ──
+	// 几百条消息的对话一口气画完要好几秒，期间整个页面是卡住的。所以开头的一段当场画出来，
+	// 其余的切成小片在后台接着画；要去的位置还没画到时（续读、搜索命中、跳到底部）加紧画，画到了再过去
+	const FIRST_CHARS = 16000; // 当场画出来的篇幅。按原文字符数算而不是按耗时：同一个对话每次打开的表现一致，短对话和以前一样一次画完
+	const SLICE_MS = 10; // 后台每一小片最多占用主线程这么久
+	const RUSH_MS = 32; // 有人等着的时候，片可以大一些
+	const BATCH = 16; // 后台画好的消息攒到这么多条（或者攒了 BATCH_MS 这么久）才放进页面
+	const BATCH_MS = 400;
+	let R = null; // 这一轮渲染。i：画到了第几条；shown：其中已经放进页面的；waits：等着某条消息出现的回调
+	const pending = () => !!R && !R.done && R.cur === state.current;
+	const weightOf = (m) => (typeof m.content === 'string' ? m.content.length : 0) || messageText(m).length;
+	// 尽快再轮到自己，但让浏览器先处理输入和绘制（setTimeout 嵌套后至少隔 4ms，后台标签页里还会被拖到 1 秒）
+	const later = (() => {
+		if (typeof MessageChannel !== 'function') return (fn) => setTimeout(fn, 0);
+		const ch = new MessageChannel();
+		let queue = [];
+		ch.port1.onmessage = () => {
+			const fns = queue;
+			queue = [];
+			for (const fn of fns) fn();
+		};
+		return (fn) => {
+			queue.push(fn);
+			ch.port2.postMessage(0);
+		};
+	})();
+	const clearBusy = (r) => {
+		clearTimeout(r.busy);
+		r.busy = 0;
+		if (r.notice && r.notice === $notice) hideNotice();
+		r.notice = null;
+	};
+	// 不再等着跳到哪里去（换了目的地，或者用户自己回了顶部）
+	const cancelJump = () => {
+		if (!R) return;
+		R.waits = R.waits.filter((w) => !w.jump);
+		clearBusy(R);
+	};
+	const dropRender = () => {
+		if (!R) return;
+		clearBusy(R);
+		R.waits = [];
+		R = null;
+	};
+	const paintLoader = (r) => {
+		const on = !r.done;
+		// 计数不必每一片都更新（每次改动都要重排一遍阅读区）
+		const now = performance.now();
+		if (on && r.painted && now - r.painted < 120) return;
+		r.painted = now;
+		if (on) r.box.setAttribute('aria-busy', 'true');
+		else r.box.removeAttribute('aria-busy');
+		if ($loader) {
+			$loader.hidden = !on;
+			if (on) $loader.lastChild.textContent = `${r.shown} / ${r.path.length}`;
+		}
+		// 顶栏进度条上的浅色一段：已经画出来的部分
+		const buf = document.querySelector('.progress b');
+		if (buf) {
+			buf.hidden = !on;
+			if (on) buf.style.transform = `scaleX(${r.shown / r.path.length})`;
+		}
+	};
+	// 查找栏开着：把新画出来的内容里的命中也标上，当前停在第几处不变
+	const refind = () => {
+		if (!$find || $find.bar.hidden || !find.q) return;
+		const i = Math.max(0, find.idx);
+		runFind();
+		gotoHit(i, false);
+	};
+	const finishRender = (r) => {
+		r.done = true;
+		paintLoader(r);
+		refind();
+		if (r.slow && popKind === 'outline' && $pop) {
+			// 目录里的小标题是从页面上读的，现在才齐
+			const top = $pop.querySelector('.outline')?.scrollTop || 0;
+			fill($pop, buildOutline());
+			const box = $pop.querySelector('.outline');
+			if (box) box.scrollTop = top;
+		}
+		updateProgress(false);
+		keepImages();
+	};
+	// 接着画，直到 stop(刚画的那条) 为真或者画完。画好的先攒着，由 flush 放进页面
+	const draw = (r, stop) => {
+		while (r.i < r.path.length) {
+			const entry = r.path[r.i++];
 			const ts = normTs(entry.msg.timestamp);
 			const day = ts ? fmtDate(ts, false) : null;
-			if (day && lastDay && day !== lastDay) nodes.push(h('div', { class: 'day-sep' }, h('span', {}, `${day} 周${'日一二三四五六'[new Date(ts * 1000).getDay()]}`)));
-			if (day) lastDay = day;
-			nodes.push(renderMessage(entry));
+			if (day && r.lastDay && day !== r.lastDay) r.items.push(h('div', { class: 'day-sep' }, h('span', {}, `${day} 周${'日一二三四五六'[new Date(ts * 1000).getDay()]}`)));
+			if (day) r.lastDay = day;
+			const el = renderMessage(entry);
+			r.items.push(el);
+			r.fresh.push(el);
+			if (stop(entry)) break;
 		}
-		$messages.replaceChildren(...nodes);
+	};
+	// 把攒着的放进页面，然后叫醒等着的
+	const flush = (r) => {
+		const { items, fresh } = r;
+		r.items = [];
+		r.fresh = [];
+		r.flushed = performance.now();
+		// 长对话里，屏幕外的消息不排版（见 style.css 的 .lazy .msg），占多高得先告诉浏览器：
+		// 先放进一个看不见的、同样宽的盒子里排一次，量出真实高度记在消息上，再挪进列表。
+		// 这样页面总高度、滚动条和每条消息的位置从一开始就是准的。
+		// 攒够一批再量：每量一次都有一笔跟文档大小有关的固定开销，一条一条地量要慢上一倍
+		if (r.meas && fresh.length) {
+			r.meas.style.width = `${r.box.getBoundingClientRect().width}px`;
+			r.meas.append(...fresh);
+			if (r.pad == null) {
+				const cs = getComputedStyle(fresh[0]);
+				r.pad = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) || 0;
+			}
+			const hs = fresh.map((el) => el.getBoundingClientRect().height);
+			fresh.forEach((el, k) => (el.style.containIntrinsicSize = `auto ${Math.max(0, hs[k] - r.pad)}px`));
+		}
+		r.box.append(...items);
+		r.els.push(...fresh);
+		r.shown = r.i;
+		if (r.shown >= r.path.length) finishRender(r);
+		else paintLoader(r);
+		const due = r.waits.filter((w) => w.k < r.shown);
+		if (!due.length) return;
+		r.waits = r.waits.filter((w) => w.k >= r.shown);
+		if (due.some((w) => w.jump)) clearBusy(r);
+		for (const w of due) if (R === r) w.fn();
+	};
+	const pump = (r, stop) => {
+		draw(r, stop);
+		flush(r);
+	};
+	const tick = (r) => {
+		if (R !== r || r.done) return;
+		if (state.current !== r.cur || !r.box.isConnected) return dropRender();
+		const t0 = performance.now();
+		const budget = r.waits.length ? RUSH_MS : SLICE_MS;
+		draw(r, () => performance.now() - t0 >= budget);
+		if (r.fresh.length >= BATCH || r.i >= r.path.length || performance.now() - r.flushed >= BATCH_MS || r.waits.some((w) => w.k < r.i)) flush(r);
+		if (R === r && !r.done) later(() => tick(r));
+	};
+	// reach：要回到的滚动位置（切换分支、同步后原地刷新），当场画到够高为止
+	function renderMessages({ reach = 0 } = {}) {
+		dropRender();
+		const path = state.current.tree.path();
+		const r = (R = { cur: state.current, box: $messages, path, index: new Map(path.map((e, k) => [String(e.msg.id), k])), i: 0, done: false, slow: false, waits: [], lastDay: null, busy: 0, notice: null, pad: null, meas: null, els: [], painted: 0, items: [], fresh: [], shown: 0, flushed: 0 });
+		$messages.replaceChildren();
 		if (!path.length) $messages.append(h('div', { class: 'empty' }, '这个对话没有消息'));
-		// 切换分支后重新标出查找结果
-		if ($find && !$find.bar.hidden && find.q) {
-			runFind();
-			gotoHit(0, false);
+		// 一次画得完的对话和以前一样，整个排版；画不完的才分批、才让屏幕外的消息不排版
+		let total = 0;
+		const lazy = path.some((e) => (total += weightOf(e.msg)) > FIRST_CHARS);
+		$messages.classList.toggle('lazy', lazy);
+		$measure?.remove();
+		$measure = null;
+		if (lazy) $messages.after((r.meas = $measure = h('div', { class: 'msg-measure', 'aria-hidden': 'true' })));
+		// 原来标出的查找结果随着旧内容一起没了
+		find.hits = [];
+		find.idx = -1;
+		let chars = 0;
+		pump(r, (e) => lazy && (chars += weightOf(e.msg)) >= FIRST_CHARS);
+		while (R === r && !r.done && reach && document.documentElement.scrollHeight < reach + window.innerHeight) {
+			let n = 0;
+			pump(r, () => ++n >= 8);
 		}
+		if (R !== r || r.done) return;
+		r.slow = true;
+		refind();
+		// 第一片先让浏览器画出来，再开始后台的活；标签页在后台时没有「下一帧」，直接排队
+		if (document.hidden) later(() => tick(r));
+		else requestAnimationFrame(() => later(() => tick(r)));
 	}
+	// 等某条消息画出来再做 fn；已经在页面上就当场做。不在当前分支上返回 false。
+	// jump（等待时的提示语）：这是要滚动过去的 —— 后来的顶替先前的，等的时候给个提示
+	const whenShown = (mid, fn, jump = '') => {
+		const r = R;
+		const k = r?.cur === state.current ? r.index.get(String(mid)) : undefined;
+		if (k == null) return false;
+		if (jump) cancelJump();
+		if (k < r.shown) {
+			fn();
+			return true;
+		}
+		r.waits.push({ k, fn, jump: !!jump });
+		if (jump) {
+			// 等得稍久才提示，眨眼就到的不必
+			r.busy = setTimeout(() => {
+				r.busy = 0;
+				if (R === r) r.notice = notify(jump, true);
+			}, 250);
+		}
+		return true;
+	};
+	const whenAll = (fn, jump = '') => {
+		const last = R?.cur === state.current ? R.path[R.path.length - 1] : null;
+		if (!last) fn();
+		else whenShown(last.msg.id, fn, jump);
+	};
+	const onPath = (mid) => R?.cur === state.current && R.index.has(String(mid));
+	const toBottom = () => whenAll(() => settle(() => document.documentElement.scrollHeight - window.innerHeight), '正在加载到对话末尾…');
+	const toTop = () => {
+		cancelJump();
+		settleRun++;
+		window.scrollTo(0, 0);
+	};
+	// 打印（包括浏览器菜单里的）要的是全文：剩下的当场画完
+	window.addEventListener('beforeprint', () => {
+		const r = R;
+		if (pending()) pump(r, () => false);
+	});
 
 	const download = (name, text, type) => {
 		const a = h('a', { href: URL.createObjectURL(new Blob([text], { type })), download: name });
@@ -1742,13 +1949,36 @@
 		const tb = document.querySelector('.topbar');
 		return (tb ? tb.getBoundingClientRect().height : 0) + 12;
 	};
-	const scrollToEl = (el) => window.scrollTo(0, Math.max(0, el.getBoundingClientRect().top + window.scrollY - topOffset()));
-	const msgEls = () => [...($messages?.children || [])].filter((el) => el.classList.contains('msg'));
-	// 当前正在读的消息：第一条还没完全滚出顶栏的
+	// 滚到 target() 算出来的位置。屏幕外的消息没有排过版（见 style.css 的 .msg），高度是估的，
+	// 滚过去之后附近的消息才排出真实高度、位置跟着变：接下来几帧里再对几次，直到对准。用户自己一动就不再管
+	let settleRun = 0;
+	const settle = (target) => {
+		const run = ++settleRun;
+		let n = 0;
+		const go = () => {
+			if (run !== settleRun) return;
+			const y = Math.max(0, Math.round(target()));
+			if (Math.abs(y - window.scrollY) > 1) window.scrollTo(0, y);
+			if (++n < 10) requestAnimationFrame(go);
+		};
+		go();
+	};
+	for (const ev of ['wheel', 'touchstart', 'keydown', 'pointerdown']) window.addEventListener(ev, () => settleRun++, { passive: true, capture: true });
+	const scrollToEl = (el) => settle(() => (el.isConnected ? el.getBoundingClientRect().top + window.scrollY - topOffset() : window.scrollY));
+	// 页面上已经画出来的消息，按顺序
+	const msgEls = () => (R?.cur === state.current && R.box.isConnected ? R.els : []);
+	// 当前正在读的消息：第一条还没完全滚出顶栏的（消息从上到下排列，二分着找）
 	const currentMsg = () => {
-		const off = topOffset();
+		const off = topOffset() + 1;
 		const els = msgEls();
-		return els.find((el) => el.getBoundingClientRect().bottom > off + 1) || els[els.length - 1] || null;
+		let lo = 0;
+		let hi = els.length - 1;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (els[mid].getBoundingClientRect().bottom > off) hi = mid;
+			else lo = mid + 1;
+		}
+		return els[lo] || null;
 	};
 	const readPos = () => {
 		const el = currentMsg();
@@ -1756,18 +1986,27 @@
 		const r = el.getBoundingClientRect();
 		return { m: el.dataset.id, r: Math.round(Math.min(1, Math.max(0, (topOffset() - r.top) / Math.max(1, r.height))) * 1000) / 1000 };
 	};
-	const restorePos = (pos) => {
+	// 回到某条消息里的某个位置（必要时切到它所在的分支）。那条消息还没画出来的话，画到了再过去
+	const restorePos = (pos, jump = '') => {
 		if (!pos?.m || !state.current) return false;
 		const { tree } = state.current;
-		if (!document.getElementById(`m-${pos.m}`) && tree.map[pos.m]) {
+		if (!onPath(pos.m) && tree.map[pos.m]) {
 			tree.selectPathTo(pos.m);
 			renderMessages();
 		}
-		const el = document.getElementById(`m-${pos.m}`);
-		if (!el) return false;
-		const r = el.getBoundingClientRect();
-		window.scrollTo(0, Math.max(0, r.top + window.scrollY + (pos.r || 0) * r.height - topOffset()));
-		return true;
+		return whenShown(
+			pos.m,
+			() => {
+				const el = document.getElementById(`m-${pos.m}`);
+				if (!el) return;
+				settle(() => {
+					if (!el.isConnected) return window.scrollY;
+					const r = el.getBoundingClientRect();
+					return r.top + window.scrollY + (pos.r || 0) * r.height - topOffset();
+				});
+			},
+			jump
+		);
 	};
 	// 版式变化（字号、宽度、展开折叠）前后，保持正在读的那一段不动
 	const keepPos = (fn) => {
@@ -1794,7 +2033,7 @@
 		if (target) scrollToEl(target);
 		else window.scrollTo(0, dir > 0 ? document.documentElement.scrollHeight : 0);
 	};
-	const setFolds = (open) =>
+	const setFolds = (open) => {
 		keepPos(() => {
 			// 展开时内层的折叠块才会生成，多走几遍
 			for (let pass = 0; pass < 3; pass++) {
@@ -1805,6 +2044,9 @@
 			}
 			for (const c of $messages.querySelectorAll('.code-block.long')) c._setOpen(open);
 		});
+		// 还没画出来的消息：画完后补上
+		if (pending()) R.waits.push({ k: R.path.length - 1, fn: () => setFolds(open), jump: false });
+	};
 	const toggleFolds = () => setFolds(!!$messages.querySelector('details:not([open]), .code-block.long:not(.open)'));
 
 	// ── 图片查看 ──
@@ -1924,6 +2166,7 @@
 			}
 			hit[0].closest('.code-block.long')?._setOpen(true);
 			hit[0].scrollIntoView({ block: 'center', inline: 'nearest' });
+			settle(() => (hit[0].isConnected ? hit[0].getBoundingClientRect().top + window.scrollY - window.innerHeight / 2 : window.scrollY));
 		}
 		showCount();
 	};
@@ -2120,7 +2363,7 @@
 							'aria-current': e === active && !sub ? 'true' : null,
 							onclick: () => {
 								closePop();
-								flashMsg(e.msg.id);
+								whenShown(e.msg.id, () => flashMsg(e.msg.id), '正在定位到这条消息…');
 							}
 						},
 						h('span', { class: 'outline-n' }, i + 1),
@@ -2214,18 +2457,22 @@
 		if ($toast) $toast.hidden = false;
 		else document.body.classList.remove('has-toast');
 	};
-	const notify = (text) => {
+	// busy：「正在做某事」，转着圈一直留到调用方收掉（返回这个提示，收的时候认它）
+	const notify = (text, busy = false) => {
 		hideNotice();
-		if (!$main?.isConnected) return;
-		$notice = h('div', { class: 'toast', role: 'status' }, h('span', { html: I.alert }), h('span', { class: 'toast-text' }, text), h('button', { class: 'icon-btn', title: '关闭', 'aria-label': '关闭', html: I.x, onclick: hideNotice }));
+		if (!$main?.isConnected) return null;
+		$notice = h('div', { class: 'toast' + (busy ? ' busy' : ''), role: 'status' }, busy ? h('span', { class: 'spinner' }) : h('span', { html: I.alert }), h('span', { class: 'toast-text' }, text), busy ? null : h('button', { class: 'icon-btn', title: '关闭', 'aria-label': '关闭', html: I.x, onclick: hideNotice }));
 		if ($toast) $toast.hidden = true;
 		$main.append($notice);
 		document.body.classList.add('has-toast');
-		noticeTimer = setTimeout(hideNotice, 5000);
+		if (!busy) noticeTimer = setTimeout(hideNotice, 5000);
+		return $notice;
 	};
 	const resumeTo = (pos) => {
 		hideToast();
-		if (!restorePos(pos)) window.scrollTo(0, ((document.documentElement.scrollHeight - window.innerHeight) * pos.p) / 100);
+		const tip = '正在回到上次读到的位置…';
+		// 记下的那条消息已经不在了：按百分比估，这得等全文都画出来
+		if (!restorePos(pos, tip)) whenAll(() => window.scrollTo(0, ((document.documentElement.scrollHeight - window.innerHeight) * pos.p) / 100), tip);
 	};
 	const showResume = (pos, label = '上次读到') => {
 		hideToast();
@@ -2252,13 +2499,22 @@
 	let saveTimer = 0;
 	let lastY = 0;
 	let goingUp = false;
+	// 读到了全文的几分之几。还在分批渲染时页面是不断变长的，按「读到第几条消息」估
+	const progressNow = () => {
+		if (pending()) {
+			const pos = readPos();
+			const k = pos && R.index.get(pos.m);
+			return k == null ? 0 : (k + pos.r) / R.path.length;
+		}
+		const max = document.documentElement.scrollHeight - window.innerHeight;
+		return max > 40 ? Math.min(1, Math.max(0, window.scrollY / max)) : 1;
+	};
 	const updateProgress = (save = true) => {
 		const bar = document.querySelector('.progress i');
 		if (!state.current || !bar) return;
 		const y = window.scrollY;
 		const max = document.documentElement.scrollHeight - window.innerHeight;
-		const p = max > 40 ? Math.min(1, Math.max(0, y / max)) : 1;
-		bar.style.transform = `scaleX(${p})`;
+		bar.style.transform = `scaleX(${progressNow()})`;
 		const title = document.querySelector('.chat-head h1');
 		const cl = document.body.classList;
 		cl.toggle('scrolled', !!title && title.getBoundingClientRect().bottom < 40);
@@ -2266,9 +2522,10 @@
 		if (Math.abs(y - lastY) > 4) goingUp = y < lastY;
 		lastY = y;
 		cl.toggle('can-top', goingUp && y > 600);
-		cl.toggle('can-bottom', !goingUp && max - y > 600);
+		cl.toggle('can-bottom', !goingUp && (max - y > 600 || pending()));
 		if ($toast && !$toast.dataset.keep && y > 400) hideToast(); // 自己往下读了，就不再提示续读
-		if (!save || $toast) return;
+		// 正等着跳到别处去的时候，眼下的位置不算数
+		if (!save || $toast || R?.waits.some((w) => w.jump)) return;
 		clearTimeout(saveTimer);
 		saveTimer = setTimeout(flushReading, 400);
 	};
@@ -2277,9 +2534,8 @@
 		saveTimer = 0;
 		if (!state.current || !document.querySelector('.progress')) return;
 		const max = document.documentElement.scrollHeight - window.innerHeight;
-		if (max <= 40) return; // 一屏以内的短对话没有"读到哪里"可言
-		const p = Math.min(1, Math.max(0, window.scrollY / max));
-		saveReading(state.current.id, { ...(readPos() || {}), p: Math.round(p * 100) });
+		if (max <= 40 && !pending()) return; // 一屏以内的短对话没有"读到哪里"可言
+		saveReading(state.current.id, { ...(readPos() || {}), p: Math.round(progressNow() * 100) });
 	};
 	window.addEventListener('pagehide', () => {
 		if (saveTimer) flushReading();
@@ -2300,8 +2556,7 @@
 		refreshRecents();
 		const id = state.current?.id;
 		if (!id || !changed.includes(id) || !unfinished(id) || $toast || !document.querySelector('.progress')) return;
-		const max = document.documentElement.scrollHeight - window.innerHeight;
-		const here = max > 40 ? Math.round((window.scrollY / max) * 100) : 100;
+		const here = Math.round(progressNow() * 100);
 		if (Math.abs(reading[id].p - here) >= 3) {
 			showResume({ ...reading[id] }, '其他设备读到');
 			$toast.dataset.keep = '1';
@@ -2314,18 +2569,19 @@
 		state.focusMessage = state.findQuery = null;
 		const { tree } = state.current;
 		if (mid == null || !tree.map[mid]) return false;
-		if (!document.getElementById(`m-${mid}`)) {
+		if (!onPath(mid)) {
 			tree.selectPathTo(mid);
 			renderMessages();
 		}
-		const el = flashMsg(mid);
-		if (!el) return false;
-		if (q) {
+		const go = () => {
+			const el = flashMsg(mid);
+			if (!el || !q) return;
 			openFind(q, { focus: false, scroll: false });
 			const i = find.hits.findIndex((hit) => el.contains(hit[0]));
 			if (i >= 0) gotoHit(i);
 			else scrollToEl(el);
-		}
+		};
+		if (!whenShown(mid, go, '正在定位到这条消息…')) return false;
 		hideToast();
 		return true;
 	};
@@ -2344,20 +2600,34 @@
 		h(
 			'div',
 			{ class: 'fab' },
-			h('button', { class: 'icon-btn fab-top', title: '回到顶部', 'aria-label': '回到顶部', html: I.toTop, onclick: () => window.scrollTo(0, 0) }),
-			h('button', { class: 'icon-btn fab-bottom', title: '跳到底部', 'aria-label': '跳到底部', html: I.toBottom, onclick: () => window.scrollTo(0, document.documentElement.scrollHeight) })
+			h('button', { class: 'icon-btn fab-top', title: '回到顶部', 'aria-label': '回到顶部', html: I.toTop, onclick: toTop }),
+			h('button', { class: 'icon-btn fab-bottom', title: '跳到底部', 'aria-label': '跳到底部', html: I.toBottom, onclick: toBottom })
 		);
 	const msgLink = (mid) => `${location.origin}${location.pathname}#/c/${encodeURIComponent(state.currentId)}/m/${encodeURIComponent(mid)}`;
 
-	async function openChat(id, { quiet = false } = {}) {
+	// 对话还没取回来（网络慢、对话大）：先把页面换成「正在加载」，免得点了像没反应
+	const showLoading = (id) => {
+		if (saveTimer) flushReading();
+		dropRender();
+		state.current = null;
+		$find = null;
+		setHome(false);
+		document.body.classList.remove('scrolled', 'can-top', 'can-bottom', 'reading');
+		$main.replaceChildren(topbar(state.byId.get(id)?.title || ''), h('div', { class: 'loading-page', role: 'status' }, h('span', { class: 'spinner' }), h('p', {}, '正在加载对话…')));
+		window.scrollTo(0, 0);
+	};
+	// quiet：同步后的原地刷新，y 是刷新后要回到的滚动位置（由调用方滚回去）
+	async function openChat(id, { quiet = false, y = 0 } = {}) {
 		if (saveTimer) flushReading();
 		closePop();
 		if (!quiet) closeLightbox();
 		hideToast();
+		cancelJump();
 		state.currentId = id;
 		refreshRecents();
 		for (const el of $list.querySelectorAll('.chat-item')) el.classList.toggle('active', el.dataset.id === id);
 		if (!id) {
+			dropRender();
 			state.current = null;
 			$find = null;
 			document.title = '对话归档';
@@ -2380,17 +2650,22 @@
 			return;
 		}
 		let data;
+		// 一眨眼就回来的不必闪一下「正在加载」
+		const waiting = quiet ? 0 : setTimeout(() => state.currentId === id && showLoading(id), 150);
 		try {
 			data = await api(`/api/chats/${encodeURIComponent(id)}`);
 		} catch (e) {
 			if (state.currentId === id) {
 				setHome(false);
+				dropRender();
 				state.current = null;
 				$find = null;
 				document.body.classList.remove('scrolled', 'can-top', 'can-bottom', 'reading');
 				$main.replaceChildren(topbar(''), h('div', { class: 'welcome' }, h('h1', {}, '无法打开'), h('p', {}, e.message)));
 			}
 			return;
+		} finally {
+			clearTimeout(waiting);
 		}
 		if (state.currentId !== id) return;
 		if (saveTimer) flushReading();
@@ -2455,6 +2730,7 @@
 				: h('span', {});
 		const chatNav = adj.newer || adj.older ? h('nav', { class: 'chat-nav', 'aria-label': '相邻对话' }, adjLink(adj.newer, '较新的对话', 'newer'), adjLink(adj.older, '较早的对话', 'older')) : null;
 		$messages = h('div', { class: 'messages' });
+		$loader = h('div', { class: 'loading-more', hidden: true }, h('span', { class: 'spinner' }), h('span', {}, '正在加载其余消息'), h('span', { class: 'loading-count' }));
 		$messages.addEventListener('click', (e) => {
 			// 正文里的图片：页内放大查看
 			if (e.target.matches?.('.md img') && !e.target.closest('a') && e.target.naturalWidth) openLightbox(e.target.getAttribute('src'), e.target);
@@ -2474,23 +2750,23 @@
 				{ class: 'reader' },
 				h('header', { class: 'chat-head' }, h('h1', {}, record.title), h('div', { class: 'chat-info' }, info.map((t) => h('span', {}, t))), h('div', { class: 'chat-tags' }, badges, tags), actions),
 				$messages,
+				$loader,
 				chatNav,
 				h('footer', { class: 'reader-foot' }, `最后同步于 ${fmtDate(data.synced_at)} · 只读归档`)
 			)
 		);
-		renderMessages();
+		renderMessages({ reach: quiet ? y : 0 });
 		if (keepFind) openFind(keepFind, { focus: false, scroll: false });
 		lastY = 0;
 		goingUp = false;
+		window.scrollTo(0, 0);
 		if (!jumpToHit()) {
-			window.scrollTo(0, 0);
 			const saved = quiet ? null : reading[id]; // 同步后的原地刷新由调用方恢复滚动位置
 			if (saved && state.resume) resumeTo({ ...saved });
 			else if (saved && unfinished(id)) showResume({ ...saved });
 		}
 		state.resume = false;
 		updateProgress(false);
-		keepImages();
 	}
 
 	const topbar = (title, tools = false) => {
@@ -2514,7 +2790,7 @@
 					: null
 			),
 			tools ? findBar() : null,
-			tools ? h('div', { class: 'progress', 'aria-hidden': 'true' }, h('i')) : null
+			tools ? h('div', { class: 'progress', 'aria-hidden': 'true' }, h('b', { hidden: true }), h('i')) : null
 		);
 	};
 
@@ -2542,8 +2818,9 @@
 		const c = cur && state.byId.get(state.currentId);
 		if (c && (c.updated_at !== cur.record.updated_at || c.missing_upstream !== cur.meta.missing_upstream || c.archived !== cur.meta.archived || c.pinned !== cur.meta.pinned)) {
 			const y = window.scrollY;
-			await openChat(state.currentId, { quiet: true });
-			window.scrollTo(0, y);
+			const pos = y > 4 ? readPos() : null;
+			await openChat(state.currentId, { quiet: true, y });
+			if (pos && !restorePos(pos)) window.scrollTo(0, y);
 		}
 		// 统计跟着对话列表走；首页开着的话原地更新
 		statsReq = null;
@@ -2641,7 +2918,7 @@
 			f: () => openFind(),
 			o: () => togglePop('outline'),
 			e: toggleFolds,
-			g: () => window.scrollTo(0, e.shiftKey ? document.documentElement.scrollHeight : 0),
+			g: e.shiftKey ? toBottom : toTop,
 			'[': () => goAdj('newer'),
 			']': () => goAdj('older')
 		}[e.key.length === 1 ? e.key.toLowerCase() : ''];

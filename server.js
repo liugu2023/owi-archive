@@ -4,6 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { DatabaseSync } = require('node:sqlite');
 
 // ───────────────────────── 配置 ─────────────────────────
@@ -657,16 +658,34 @@ const SECURITY_HEADERS = {
 		"default-src 'self'; img-src 'self' data: https: http:; media-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 };
 
+// 文本类的响应按浏览器的意愿压缩：长对话的 JSON 有几 MB，压缩后只剩一两成，手机网络下差别很大
+const COMPRESSIBLE = /^(?:text\/|application\/json|image\/svg)/;
+const MIN_COMPRESS = 1024;
+const encodingFor = (req) => {
+	const accept = String(req?.headers['accept-encoding'] || '');
+	return /\bbr\b/.test(accept) ? 'br' : /\bgzip\b/.test(accept) ? 'gzip' : null;
+};
+const compressor = (enc) => (enc === 'br' ? zlib.createBrotliCompress({ params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } }) : zlib.createGzip({ level: 6 }));
+
 function send(res, status, body, headers = {}) {
 	const isObj = body !== null && typeof body === 'object' && !Buffer.isBuffer(body);
 	const payload = isObj ? JSON.stringify(body) : (body ?? '');
-	res.writeHead(status, {
+	const head = {
 		...SECURITY_HEADERS,
 		'Content-Type': isObj ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8',
 		'Cache-Control': 'no-store',
 		...headers
-	});
-	res.end(payload);
+	};
+	const enc = payload.length >= MIN_COMPRESS && COMPRESSIBLE.test(head['Content-Type']) && !head['Content-Disposition'] ? encodingFor(res.req) : null;
+	if (!enc) {
+		res.writeHead(status, head);
+		return res.end(payload);
+	}
+	res.writeHead(status, { ...head, 'Content-Encoding': enc, Vary: 'Accept-Encoding' });
+	const z = compressor(enc);
+	z.on('error', () => res.destroy());
+	z.pipe(res);
+	z.end(payload);
 }
 
 function serveFile(req, res, file, headers = {}) {
@@ -680,13 +699,24 @@ function serveFile(req, res, file, headers = {}) {
 			'Cache-Control': 'private, no-cache',
 			...headers
 		};
+		const enc = st.size >= MIN_COMPRESS && COMPRESSIBLE.test(base['Content-Type']) ? encodingFor(req) : null;
+		if (enc) base.Vary = 'Accept-Encoding';
 		if (req.headers['if-none-match'] === etag) {
 			res.writeHead(304, base);
 			return res.end();
 		}
-		res.writeHead(200, { ...base, 'Content-Length': st.size });
+		if (!enc) {
+			res.writeHead(200, { ...base, 'Content-Length': st.size });
+			if (req.method === 'HEAD') return res.end();
+			return fs.createReadStream(file).pipe(res);
+		}
+		res.writeHead(200, { ...base, 'Content-Encoding': enc });
 		if (req.method === 'HEAD') return res.end();
-		fs.createReadStream(file).pipe(res);
+		const z = compressor(enc);
+		const src = fs.createReadStream(file);
+		src.on('error', () => res.destroy());
+		z.on('error', () => res.destroy());
+		src.pipe(z).pipe(res);
 	});
 }
 
