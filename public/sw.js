@@ -2,7 +2,7 @@
 'use strict';
 const STATIC = 'owa-static-v1';
 const DATA = 'owa-data-v1'; // 登录后才能拿到的内容，退出登录 / 会话失效时整个删掉
-const SHELL = ['/', '/app.js', '/style.css', '/favicon.svg', '/vendor/marked.js', '/vendor/purify.js', '/vendor/highlight.js', '/vendor/hljs-light.css', '/vendor/hljs-dark.css', '/vendor/katex/katex.min.css', '/vendor/katex/katex.min.js'];
+const SHELL = ['/', '/theme-init.js', '/app.js', '/style.css', '/favicon.svg', '/vendor/marked.js', '/vendor/purify.js', '/vendor/highlight.js', '/vendor/hljs-light.css', '/vendor/hljs-dark.css', '/vendor/katex/katex.min.css', '/vendor/katex/katex.min.js'];
 const INDEX = '/api/index';
 const KEEP = new Set([INDEX, '/api/stars', '/api/stats']); // 不参与淘汰
 const MAX_ENTRIES = 1000;

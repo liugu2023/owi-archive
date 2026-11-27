@@ -258,20 +258,30 @@
 	};
 
 	// ───────────── 主题 ─────────────
+	const themePref = () => localStorage.getItem('theme') || 'auto';
 	const applyTheme = () => {
-		const pref = localStorage.getItem('theme') || 'auto';
+		const pref = themePref();
 		const dark = pref === 'dark' || (pref === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
 		document.documentElement.dataset.theme = dark ? 'dark' : 'light';
 		document.getElementById('hljs-dark').disabled = !dark;
 		document.getElementById('hljs-light').disabled = dark;
 		const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
 		if (bg) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bg);
+		for (const b of document.querySelectorAll('.theme-seg button')) {
+			const on = b.dataset.themePref === pref;
+			b.classList.toggle('on', on);
+			b.setAttribute('aria-pressed', String(on));
+		}
 	};
 	matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 	applyTheme();
-	const toggleTheme = () => {
-		localStorage.setItem('theme', document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+	const setTheme = (pref) => {
+		if (pref === 'auto') localStorage.removeItem('theme');
+		else localStorage.setItem('theme', pref);
 		applyTheme();
+	};
+	const toggleTheme = () => {
+		setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
 	};
 
 	// ───────────── 阅读偏好与阅读记录（仅存在本机浏览器里） ─────────────
@@ -501,9 +511,11 @@
 				await navigator.clipboard.writeText(getText());
 				btn.innerHTML = I.check;
 				btn.classList.add('ok');
+				btn.setAttribute('title', '已复制');
 				setTimeout(() => {
 					btn.innerHTML = ico;
 					btn.classList.remove('ok');
+					btn.setAttribute('title', label);
 				}, 1200);
 			} catch {}
 		});
@@ -924,12 +936,27 @@
 	}
 
 	// ───────────── 布局 ─────────────
-	let $list, $main, $status, $search, $tabs, $filterBtn, $filters;
+	let $list, $main, $status, $search, $searchClear, $tabs, $filterBtn, $filters, $filterChips;
 
 	function renderShell() {
 		$search = h('input', { type: 'search', placeholder: '搜索标题和内容…', 'aria-label': '搜索', value: state.query });
+		$searchClear = h('button', {
+			class: 'search-clear',
+			type: 'button',
+			title: '清空搜索',
+			'aria-label': '清空搜索',
+			html: I.x,
+			hidden: !state.query,
+			onclick: () => {
+				$search.value = '';
+				$searchClear.hidden = true;
+				doSearch('');
+				$search.focus();
+			}
+		});
 		let timer;
 		$search.addEventListener('input', () => {
+			$searchClear.hidden = !$search.value;
 			clearTimeout(timer);
 			timer = setTimeout(() => doSearch($search.value), 250);
 		});
@@ -939,6 +966,7 @@
 			renderSidebar();
 		});
 		$filters = h('div', { class: 'filters', hidden: true });
+		$filterChips = h('div', { class: 'filter-chips', hidden: true });
 		$tabs = h('div', { class: 'tabs', role: 'tablist' });
 		$list = h('nav', { class: 'chat-list', 'aria-label': '对话列表' });
 		$status = h('div', { class: 'sync' });
@@ -956,18 +984,12 @@
 					h('span', { class: 'when-light', html: I.theme }),
 					h('span', { class: 'when-dark', html: I.sun })
 				),
-				h('button', {
-					class: 'icon-btn',
-					title: '退出登录',
-					'aria-label': '退出登录',
-					html: I.logout,
-					onclick: logout
-				}),
 				h('button', { class: 'icon-btn side-hide', title: '收起侧栏', 'aria-label': '收起侧栏', html: I.panel, onclick: () => setSide(false) }),
 				h('button', { class: 'icon-btn side-close', title: '关闭对话列表', 'aria-label': '关闭对话列表', html: I.close, onclick: closeNav })
 			),
-			h('div', { class: 'search-row' }, h('label', { class: 'search' }, h('span', { html: I.search }), $search, h('kbd', { class: 'kbd', title: '按 / 聚焦搜索', 'aria-hidden': 'true' }, '/')), $filterBtn),
+			h('div', { class: 'search-row' }, h('label', { class: 'search' }, h('span', { html: I.search }), $search, $searchClear, h('kbd', { class: 'kbd', title: '按 / 聚焦搜索', 'aria-hidden': 'true' }, '/')), $filterBtn),
 			$filters,
+			$filterChips,
 			$tabs,
 			$list,
 			$status
@@ -1118,10 +1140,36 @@
 			snippetNode(x.snippet)
 		);
 
+	const DAYS_LABELS = new Map([[7, '近 7 天'], [30, '近 30 天'], [90, '近 3 个月'], [365, '近一年']]);
 	function renderFilters() {
 		$filterBtn.setAttribute('aria-expanded', String(state.filterOpen));
 		$filterBtn.classList.toggle('on', filterOn());
 		$filters.hidden = !state.filterOpen;
+		// 筛选行收起但仍有筛选条件生效时，展示可一键移除的胶囊
+		const showChips = !state.filterOpen && filterOn();
+		$filterChips.hidden = !showChips;
+		if (showChips) {
+			const chip = (label, clear) =>
+				h(
+					'button',
+					{
+						class: 'filter-chip',
+						type: 'button',
+						title: `移除筛选：${label}`,
+						onclick: () => {
+							clear();
+							renderSidebar();
+						}
+					},
+					h('span', { class: 'filter-chip-label' }, label),
+					h('span', { html: I.x })
+				);
+			fill(
+				$filterChips,
+				state.filter.model ? chip(state.filter.model, () => (state.filter.model = '')) : null,
+				state.filter.days ? chip(DAYS_LABELS.get(state.filter.days) || `近 ${state.filter.days} 天`, () => (state.filter.days = 0)) : null
+			);
+		}
 		if (!state.filterOpen) return;
 		// 模型按出现的对话数排序；当前选中的模型即使已经不在归档里也保留在列表中
 		const freq = new Map();
@@ -1344,6 +1392,7 @@
 	async function doSearch(value) {
 		const qv = value.trim();
 		state.query = qv;
+		if ($searchClear) $searchClear.hidden = !qv;
 		if (!qv) {
 			state.results = null;
 			renderSidebar();
@@ -1395,7 +1444,14 @@
 					s.last_error && !s.running ? `同步出错：${s.last_error}` : `${s.chats} 个对话 · ${s.messages} 条消息`)
 			),
 			s.chats && !offline ? h('a', { class: 'icon-btn export-all', href: '/api/export', download: '', title: '导出全部对话（JSON，可重新导入 Open WebUI）', 'aria-label': '导出全部对话', html: I.download }) : null,
-			btn
+			btn,
+			h('button', {
+				class: 'icon-btn',
+				title: '退出登录',
+				'aria-label': '退出登录',
+				html: I.logout,
+				onclick: logout
+			})
 		);
 	}
 	function pollStatus(delay = 30000) {
@@ -1526,7 +1582,7 @@
 		});
 		return h(
 			'article',
-			{ class: `msg ${role}` + (starred ? ' starred' : ''), id: `m-${m.id}`, dataset: { id: m.id } },
+			{ class: `msg ${role}` + (starred ? ' starred' : '') + (entry.siblings.length > 1 ? ' has-branch' : ''), id: `m-${m.id}`, dataset: { id: m.id } },
 			h(
 				'header',
 				{ class: 'msg-head' },
@@ -1781,26 +1837,38 @@
 		}
 		const peak = Math.max(1, ...months.map((x) => x.n));
 		const peakAt = months.findIndex((x) => x.n === peak);
-		const monthly = h(
-			'section',
-			{ class: 'viz' },
-			h('h2', {}, '近 12 个月新建的对话'),
-			h(
+		const readout = h('span', { class: 'viz-readout', 'aria-live': 'polite' });
+		let pickedCol = null;
+		const cols = months.map((x, i) => {
+			const tip = `${x.y} 年 ${x.m} 月：${x.n} 个对话`;
+			const col = h(
 				'div',
-				{ class: 'bars', role: 'img', 'aria-label': months.map((x) => `${x.y} 年 ${x.m} 月 ${x.n} 个`).join('，') },
-				months.map((x, i) =>
-					h(
-						'div',
-						{ class: 'bar-col', title: `${x.y} 年 ${x.m} 月：${x.n} 个对话` },
-						// 只给最高的一根标数值，其余悬停查看
-						// 柱子单独占一个绘图区，高度才是相对同一个基准的百分比
-						h('span', { class: 'bar-plot' }, i === peakAt && x.n ? h('span', { class: 'bar-val' }, x.n) : null, h('i', { class: x.n ? '' : 'zero', style: `height:${x.n ? Math.max(2, (x.n / peak) * 100) : 0}%` })),
-						// 年份只标在第一根和每年 1 月；窄屏上柱子很细，年份另起一行（见 style.css 的 .bar-yy）
-						h('span', { class: 'bar-x' }, i === 0 || x.m === 1 ? h('span', { class: 'bar-yy' }, String(x.y).slice(2), h('span', {}, '/')) : null, h('span', {}, x.m))
-					)
-				)
-			)
+				{ class: 'bar-col', title: tip },
+				// 只给最高的一根标数值，其余悬停或点击查看
+				// 柱子单独占一个绘图区，高度才是相对同一个基准的百分比
+				h('span', { class: 'bar-plot' }, i === peakAt && x.n ? h('span', { class: 'bar-val' }, x.n) : null, h('i', { class: x.n ? '' : 'zero', style: `height:${x.n ? Math.max(2, (x.n / peak) * 100) : 0}%` })),
+				// 年份只标在第一根和每年 1 月；窄屏上柱子很细，年份另起一行（见 style.css 的 .bar-yy）
+				h('span', { class: 'bar-x' }, i === 0 || x.m === 1 ? h('span', { class: 'bar-yy' }, String(x.y).slice(2), h('span', {}, '/')) : null, h('span', {}, x.m))
+			);
+			col.addEventListener('pointerenter', () => (readout.textContent = tip));
+			col.addEventListener('click', () => {
+				const same = pickedCol === col;
+				pickedCol?.classList.remove('picked');
+				pickedCol = same ? null : col;
+				pickedCol?.classList.add('picked');
+				readout.textContent = same ? '' : tip;
+			});
+			return col;
+		});
+		const barsBox = h(
+			'div',
+			{ class: 'bars', role: 'img', 'aria-label': months.map((x) => `${x.y} 年 ${x.m} 月 ${x.n} 个`).join('，') },
+			cols
 		);
+		barsBox.addEventListener('pointerleave', () => {
+			readout.textContent = pickedCol ? pickedCol.title : '';
+		});
+		const monthly = h('section', { class: 'viz' }, h('div', { class: 'viz-head' }, h('h2', {}, '近 12 个月新建的对话'), readout), barsBox);
 		const ranked = [...freq].sort((a, b) => b[1] - a[1]);
 		const top = ranked.slice(0, 6);
 		const rest = ranked.slice(6);
@@ -1911,7 +1979,35 @@
 					h(
 						'tbody',
 						{},
-						st.models.map((m) => h('tr', {}, h('th', { title: m.name }, m.name), h('td', {}, m.messages), h('td', {}, big(m.chars)), tok(m, 'input'), tok(m, 'output')))
+						st.models.map((m) =>
+							h(
+								'tr',
+								{},
+								h(
+									'th',
+									{ title: `只看 ${m.name} 的对话` },
+									h(
+										'button',
+										{
+											class: 'usage-model',
+											type: 'button',
+											onclick: () => {
+												state.filter.model = m.name;
+												state.filterOpen = true;
+												state.view = 'active';
+												renderSidebar();
+												openNav();
+											}
+										},
+										m.name
+									)
+								),
+								h('td', {}, m.messages),
+								h('td', {}, big(m.chars)),
+								tok(m, 'input'),
+								tok(m, 'output')
+							)
+						)
 					),
 					h(
 						'tfoot',
@@ -2023,6 +2119,14 @@
 		el.classList.add('flash');
 		return el;
 	};
+	let stepTimer = 0;
+	const markStepped = (el) => {
+		clearTimeout(stepTimer);
+		for (const prev of document.querySelectorAll('.msg.stepped')) prev.classList.remove('stepped');
+		if (!el) return;
+		el.classList.add('stepped');
+		stepTimer = setTimeout(() => el.classList.remove('stepped'), 900);
+	};
 	const stepMsg = (dir) => {
 		const els = msgEls();
 		const cur = currentMsg();
@@ -2030,8 +2134,10 @@
 		const i = els.indexOf(cur);
 		const into = topOffset() - cur.getBoundingClientRect().top;
 		const target = dir > 0 ? (into < -8 ? cur : els[i + 1]) : into > 8 ? cur : els[i - 1];
-		if (target) scrollToEl(target);
-		else window.scrollTo(0, dir > 0 ? document.documentElement.scrollHeight : 0);
+		if (target) {
+			scrollToEl(target);
+			markStepped(target);
+		} else window.scrollTo(0, dir > 0 ? document.documentElement.scrollHeight : 0);
 	};
 	const setFolds = (open) => {
 		keepPos(() => {
@@ -2107,6 +2213,21 @@
 			),
 			stage
 		);
+		// 保持键盘 Tab 焦点留在图片查看器内
+		$lightbox.addEventListener('keydown', (e) => {
+			if (e.key !== 'Tab') return;
+			const focusables = [...$lightbox.querySelectorAll('button:not([hidden]), a:not([hidden])')];
+			if (!focusables.length) return;
+			const first = focusables[0];
+			const last = focusables[focusables.length - 1];
+			if (e.shiftKey && document.activeElement === first) {
+				e.preventDefault();
+				last.focus();
+			} else if (!e.shiftKey && document.activeElement === last) {
+				e.preventDefault();
+				first.focus();
+			}
+		});
 		if (n > 1) {
 			lbStep = (d) => show(i + d);
 			// 手机上左右滑动翻页（放大查看原图时滑动用来拖动图片）
@@ -2424,8 +2545,31 @@
 			return b;
 		};
 		const key = (k, label) => h('div', { class: 'key-row' }, h('span', {}, label), h('span', {}, k.split(' ').map((x) => h('kbd', { class: 'kbd' }, x))));
+		const curTheme = themePref();
+		const themeSeg = h(
+			'div',
+			{ class: 'seg theme-seg', role: 'group', 'aria-label': '界面主题' },
+			[
+				['light', '浅色'],
+				['dark', '深色'],
+				['auto', '跟随系统']
+			].map(([v, label]) =>
+				h(
+					'button',
+					{
+						type: 'button',
+						class: curTheme === v ? 'on' : '',
+						'aria-pressed': String(curTheme === v),
+						dataset: { themePref: v },
+						onclick: () => setTheme(v)
+					},
+					label
+				)
+			)
+		);
 		return [
 			h('div', { class: 'pop-title' }, '阅读设置'),
+			h('div', { class: 'set-row' }, h('span', {}, '界面主题'), themeSeg),
 			h('div', { class: 'set-row' }, h('span', {}, '正文字号'), h('span', { class: 'font-step' }, minus, val, plus)),
 			sw('宽版布局', 'wide', 'only-desktop'),
 			sw('代码自动换行', 'wrap'),
@@ -2640,6 +2784,14 @@
 		state.currentId = id;
 		refreshRecents();
 		for (const el of $list.querySelectorAll('.chat-item')) el.classList.toggle('active', el.dataset.id === id);
+		if (id && !quiet) {
+			const act = $list.querySelector('.chat-item.active:not(.recent)');
+			if (act) {
+				const lr = $list.getBoundingClientRect();
+				const ar = act.getBoundingClientRect();
+				if (ar.top < lr.top || ar.bottom > lr.bottom) act.scrollIntoView({ block: 'nearest' });
+			}
+		}
 		if (!id) {
 			dropRender();
 			state.current = null;
@@ -2909,6 +3061,10 @@
 		if (e.key === 'Escape') {
 			// 一次只关一层
 			if (closeLightbox()) return;
+			if (document.activeElement === $search && !navShowing()) {
+				$search.blur();
+				return;
+			}
 			if (navShowing()) return closeNav();
 			if (!closePop() && !closeFind()) closeNav();
 			return;
